@@ -1,19 +1,29 @@
 "use client";
 
 /**
- * FaceSense Phase 1 — Real-time Face Detection
+ * FaceSense Phase 2 — Emotion · Stress · Blink Detection
  *
- * Fixes applied:
- *  1. Mirrored label text — save/restore ctx transform, flip back before drawing text/corners
- *  2. willReadFrequently — pass { willReadFrequently: true } to getContext("2d")
- *  3. Low FPS — decouple inference from rAF; run inference on a fixed interval (100ms = ~10fps cap)
- *     and use rAF only for the draw step, so the UI never blocks
+ * Phase 1 features preserved:
+ *   ✓ Webcam streaming
+ *   ✓ Face detection (SSD MobileNet v1)
+ *   ✓ 68-point landmark detection
+ *   ✓ Canvas rendering with mirrored-label fix
+ *   ✓ willReadFrequently optimisation
+ *   ✓ Decoupled inference / draw loops
+ *
+ * Phase 2 additions:
+ *   + Emotion detection via faceExpressionNet
+ *   + Stress score derived from emotion weights
+ *   + Blink detection via Eye Aspect Ratio (EAR)
+ *   + Alert system (stress > 0.7 for 10 s, blink rate < 8 /min)
+ *   + Analytics panel (emotion, stress bar, blink rate)
+ *   + Backend POST every 3 s (non-blocking, gracefully offline)
  */
 
 import { useEffect, useRef, useCallback, useState } from "react";
 import * as faceapi from "face-api.js";
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+// ─── Types ─────────────────────────────────────────────────────────────────────
 type Status =
   | "idle"
   | "loading-models"
@@ -43,35 +53,133 @@ const STATUS_COLORS: Record<Status, string> = {
   error: "text-red-400",
 };
 
-// Shared type for one detected face result
 type FaceResult = {
   detection: faceapi.FaceDetection;
   landmarks: faceapi.FaceLandmarks68;
+  expressions: faceapi.FaceExpressions;
 };
 
-// ─── Component ────────────────────────────────────────────────────────────────
+// Stress weights per emotion (0 = calm, 1 = max stress)
+const STRESS_WEIGHTS: Record<string, number> = {
+  angry: 0.95,
+  disgusted: 0.75,
+  fearful: 0.90,
+  sad: 0.65,
+  surprised: 0.45,
+  neutral: 0.10,
+  happy: 0.05,
+};
+
+const EMOTION_EMOJI: Record<string, string> = {
+  angry: "😠",
+  disgusted: "🤢",
+  fearful: "😨",
+  sad: "😢",
+  surprised: "😲",
+  neutral: "😐",
+  happy: "😊",
+};
+
+const EMOTION_COLORS: Record<string, string> = {
+  angry: "#ef4444",
+  disgusted: "#a855f7",
+  fearful: "#f97316",
+  sad: "#3b82f6",
+  surprised: "#eab308",
+  neutral: "#6b7280",
+  happy: "#22c55e",
+};
+
+// EAR threshold — eyes considered closed below this.
+// face-api.js landmarks at typical webcam resolution yield EAR ~0.25–0.35 open,
+// ~0.10–0.18 fully closed. 0.21 is too tight and misses real blinks. 0.25 is reliable.
+const EAR_THRESHOLD = 0.25;
+// At 150 ms inference a real blink (100–400 ms) spans only 1–2 frames.
+// Requiring 2 consecutive frames causes short blinks to be missed entirely.
+const BLINK_CONSEC_FRAMES = 1;
+// Minimum elapsed seconds before reporting a rate (avoids "60/min" after 1 blink in 1 s)
+const BLINK_RATE_MIN_ELAPSED_S = 10;
+
+// ─── EAR Calculation ───────────────────────────────────────────────────────────
+function euclidean(a: faceapi.Point, b: faceapi.Point) {
+  return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2);
+}
+
+function eyeAspectRatio(pts: faceapi.Point[]): number {
+  // Soukupova & Cech 2016 formula
+  const A = euclidean(pts[1], pts[5]);
+  const B = euclidean(pts[2], pts[4]);
+  const C = euclidean(pts[0], pts[3]);
+  return (A + B) / (2.0 * C);
+}
+
+// ─── Stress calculation ────────────────────────────────────────────────────────
+function mapEmotionToStress(expressions: faceapi.FaceExpressions): number {
+  let score = 0;
+  const exprObj = expressions as unknown as Record<string, number>;
+  for (const [emotion, weight] of Object.entries(STRESS_WEIGHTS)) {
+    score += (exprObj[emotion] ?? 0) * weight;
+  }
+  return Math.min(1, score);
+}
+
+function dominantEmotion(expressions: faceapi.FaceExpressions): string {
+  const exprObj = expressions as unknown as Record<string, number>;
+  return Object.entries(exprObj).reduce((a, b) => (b[1] > a[1] ? b : a))[0];
+}
+
+// ─── Backend helpers ───────────────────────────────────────────────────────────
+const BACKEND_URL =
+  typeof process !== "undefined" && process.env.NEXT_PUBLIC_BACKEND_URL
+    ? process.env.NEXT_PUBLIC_BACKEND_URL
+    : "http://localhost:5000";
+
+// ─── Component ─────────────────────────────────────────────────────────────────
 export default function FaceSensePage() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
 
-  // rAF handle for the draw loop
   const rafRef = useRef<number | null>(null);
-  // Interval handle for the inference loop
   const inferIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  // Latest inference results shared between inference loop → draw loop
+  const apiIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const latestResultsRef = useRef<FaceResult[]>([]);
 
   const modelsLoadedRef = useRef(false);
-  const isRunningRef = useRef(false); // used inside callbacks to avoid stale state
+  const isRunningRef = useRef(false);
+
+  // Blink tracking
+  const blinkCountRef = useRef(0);
+  const blinkConsecRef = useRef(0);
+  const blinkStartTimeRef = useRef<number>(Date.now());
+  const eyeClosedRef = useRef(false);
+
+  // Stress alert tracking
+  const stressHighSinceRef = useRef<number | null>(null);
+  const alertFiredRef = useRef(false);
+
+  // Latest analytics refs (for draw loop and API loop — no stale closures)
+  const latestEmotionRef = useRef("neutral");
+  const latestStressRef = useRef(0);
+  const latestBlinkRateRef = useRef(0);
 
   const [status, setStatus] = useState<Status>("idle");
   const [errorMsg, setErrorMsg] = useState<string>("");
   const [faceCount, setFaceCount] = useState(0);
   const [fps, setFps] = useState(0);
+
+  // Phase 2 UI state
+  const [emotion, setEmotion] = useState("neutral");
+  const [stressScore, setStressScore] = useState(0);
+  const [blinkRate, setBlinkRate] = useState(0);
+  const [blinkCount, setBlinkCount] = useState(0);
+  const [alertStress, setAlertStress] = useState(false);
+  const [alertBlink, setAlertBlink] = useState(false);
+  const [backendOk, setBackendOk] = useState<boolean | null>(null);
+
   const fpsRef = useRef({ frames: 0, last: performance.now() });
 
-  // ── Load models ───────────────────────────────────────────────────────────
+  // ── Load models (Phase 2 adds faceExpressionNet) ─────────────────────────────
   const loadModels = useCallback(async () => {
     if (modelsLoadedRef.current) return;
     setStatus("loading-models");
@@ -80,17 +188,20 @@ export default function FaceSensePage() {
       await Promise.all([
         faceapi.nets.ssdMobilenetv1.loadFromUri("/models"),
         faceapi.nets.faceLandmark68Net.loadFromUri("/models"),
+        faceapi.nets.faceExpressionNet.loadFromUri("/models"),
       ]);
       modelsLoadedRef.current = true;
       setStatus("models-ready");
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Unknown error";
-      setErrorMsg(`Model load failed: ${msg}. Run: node scripts/download-models.js`);
+      setErrorMsg(
+        `Model load failed: ${msg}. Run: node scripts/download-models.js`
+      );
       setStatus("error");
     }
   }, []);
 
-  // ── Start camera ──────────────────────────────────────────────────────────
+  // ── Start camera ─────────────────────────────────────────────────────────────
   const startCamera = useCallback(async () => {
     if (!modelsLoadedRef.current) {
       await loadModels();
@@ -115,10 +226,19 @@ export default function FaceSensePage() {
       canvas.width = video.videoWidth;
       canvas.height = video.videoHeight;
 
+      // Reset Phase 2 state
+      blinkCountRef.current = 0;
+      blinkConsecRef.current = 0;
+      blinkStartTimeRef.current = Date.now();
+      eyeClosedRef.current = false;
+      stressHighSinceRef.current = null;
+      alertFiredRef.current = false;
+
       isRunningRef.current = true;
       setStatus("detecting");
       startInferenceLoop();
       startDrawLoop();
+      startApiLoop();
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Unknown error";
       if (/permission|denied/i.test(msg)) {
@@ -132,42 +252,31 @@ export default function FaceSensePage() {
     }
   }, [loadModels]);
 
-  // ── Stop camera ───────────────────────────────────────────────────────────
+  // ── Stop camera ──────────────────────────────────────────────────────────────
   const stopCamera = useCallback(() => {
     isRunningRef.current = false;
 
-    if (rafRef.current !== null) {
-      cancelAnimationFrame(rafRef.current);
-      rafRef.current = null;
-    }
-    if (inferIntervalRef.current !== null) {
-      clearInterval(inferIntervalRef.current);
-      inferIntervalRef.current = null;
-    }
+    if (rafRef.current !== null) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
+    if (inferIntervalRef.current !== null) { clearInterval(inferIntervalRef.current); inferIntervalRef.current = null; }
+    if (apiIntervalRef.current !== null) { clearInterval(apiIntervalRef.current); apiIntervalRef.current = null; }
     latestResultsRef.current = [];
 
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((t) => t.stop());
-      streamRef.current = null;
-    }
+    if (streamRef.current) { streamRef.current.getTracks().forEach((t) => t.stop()); streamRef.current = null; }
     if (videoRef.current) videoRef.current.srcObject = null;
 
     const canvas = canvasRef.current;
     if (canvas) {
-      // FIX 2: willReadFrequently — same option used consistently
       const ctx = canvas.getContext("2d", { willReadFrequently: true });
       ctx?.clearRect(0, 0, canvas.width, canvas.height);
     }
 
-    setFaceCount(0);
-    setFps(0);
-    setStatus("idle");
-    setErrorMsg("");
+    setFaceCount(0); setFps(0);
+    setEmotion("neutral"); setStressScore(0); setBlinkRate(0); setBlinkCount(0);
+    setAlertStress(false); setAlertBlink(false);
+    setStatus("idle"); setErrorMsg("");
   }, []);
 
-  // ── Inference loop (runs on interval, NOT rAF) ────────────────────────────
-  // FIX 3: Decoupled from rAF so heavy inference never starves the draw loop.
-  // 100 ms interval = max ~10 inference calls/sec, which is plenty for face detection.
+  // ── Inference loop — 150 ms, Phase 2: withFaceExpressions ───────────────────
   const startInferenceLoop = useCallback(() => {
     const video = videoRef.current;
     if (!video) return;
@@ -178,36 +287,120 @@ export default function FaceSensePage() {
       try {
         const detections = await faceapi
           .detectAllFaces(video, new faceapi.SsdMobilenetv1Options({ minConfidence: 0.5 }))
-          .withFaceLandmarks();
+          .withFaceLandmarks()
+          .withFaceExpressions();
 
         const displaySize = { width: video.videoWidth, height: video.videoHeight };
-        latestResultsRef.current = faceapi.resizeResults(
-          detections,
-          displaySize
-        ) as FaceResult[];
+        const resized = faceapi.resizeResults(detections, displaySize) as FaceResult[];
+        latestResultsRef.current = resized;
 
-        // Update React state (cheap — only face count changes)
-        setFaceCount(latestResultsRef.current.length);
-        setStatus(latestResultsRef.current.length === 0 ? "no-face" : "detecting");
+        setFaceCount(resized.length);
+        setStatus(resized.length === 0 ? "no-face" : "detecting");
+
+        if (resized.length > 0) {
+          const first = resized[0];
+
+          // ── Emotion & Stress ─────────────────────────────────────────────
+          const dom = dominantEmotion(first.expressions);
+          const stress = mapEmotionToStress(first.expressions);
+          latestEmotionRef.current = dom;
+          latestStressRef.current = stress;
+          setEmotion(dom);
+          setStressScore(Math.round(stress * 100) / 100);
+
+          // ── Blink (EAR) ──────────────────────────────────────────────────
+          const pts = first.landmarks.positions;
+          const leftEye = pts.slice(36, 42);
+          const rightEye = pts.slice(42, 48);
+          const ear = (eyeAspectRatio(leftEye) + eyeAspectRatio(rightEye)) / 2;
+
+          if (ear < EAR_THRESHOLD) {
+            blinkConsecRef.current++;
+          } else {
+            if (blinkConsecRef.current >= BLINK_CONSEC_FRAMES) {
+              blinkCountRef.current++;
+              setBlinkCount(blinkCountRef.current);
+            }
+            blinkConsecRef.current = 0;
+          }
+          eyeClosedRef.current = ear < EAR_THRESHOLD;
+
+          // Rate: use elapsed time but clamp to a rolling 60-s window to avoid
+          // wild numbers at session start, and require at least 10 s of data.
+          const elapsedSec = (Date.now() - blinkStartTimeRef.current) / 1000;
+          const windowSec = Math.min(elapsedSec, 60); // cap at 60 s window
+          const rate = elapsedSec >= BLINK_RATE_MIN_ELAPSED_S
+            ? Math.round((blinkCountRef.current / windowSec) * 60)
+            : 0; // show 0 until we have enough data
+          latestBlinkRateRef.current = rate;
+          setBlinkRate(rate);
+
+          // ── Alerts ───────────────────────────────────────────────────────
+          if (stress > 0.7) {
+            if (stressHighSinceRef.current === null) stressHighSinceRef.current = Date.now();
+            if (Date.now() - stressHighSinceRef.current > 10000 && !alertFiredRef.current) {
+              alertFiredRef.current = true;
+              setAlertStress(true);
+              playBeep(880, 0.3);
+            }
+          } else {
+            stressHighSinceRef.current = null;
+            alertFiredRef.current = false;
+            setAlertStress(false);
+          }
+
+          const elapsed30s = (Date.now() - blinkStartTimeRef.current) > 30000;
+          if (elapsed30s && rate < 8 && rate > 0) {
+            setAlertBlink(true);
+          } else if (rate >= 8) {
+            setAlertBlink(false);
+          }
+        } else {
+          latestEmotionRef.current = "neutral";
+          latestStressRef.current = 0;
+          setEmotion("neutral"); setStressScore(0);
+          stressHighSinceRef.current = null;
+          alertFiredRef.current = false;
+          setAlertStress(false);
+        }
       } catch {
-        // Silently skip frames that fail (e.g. video not ready yet)
+        // Skip failed frames silently
       }
-    }, 100); // 10 fps inference cap — smooth enough, CPU-friendly
+    }, 150);
   }, []);
 
-  // ── Draw loop (runs on rAF — smooth 60fps canvas redraws) ─────────────────
+  // ── API loop — POST to backend every 3 s ────────────────────────────────────
+  const startApiLoop = useCallback(() => {
+    apiIntervalRef.current = setInterval(async () => {
+      if (!isRunningRef.current || latestResultsRef.current.length === 0) return;
+      try {
+        const res = await fetch(`${BACKEND_URL}/api/session`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            emotion: latestEmotionRef.current,
+            stressScore: latestStressRef.current,
+            blinkRate: latestBlinkRateRef.current,
+            timestamp: new Date().toISOString(),
+          }),
+        });
+        setBackendOk(res.ok);
+      } catch {
+        setBackendOk(false);
+      }
+    }, 3000);
+  }, []);
+
+  // ── Draw loop — unchanged from Phase 1 + emotion label colour ───────────────
   const startDrawLoop = useCallback(() => {
     const video = videoRef.current;
     const canvas = canvasRef.current;
     if (!video || !canvas) return;
 
-    // FIX 2: Pass willReadFrequently so the browser optimises the backing store
-    // for frequent pixel reads (face-api.js reads pixel data internally).
     const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
 
     function draw() {
       if (!isRunningRef.current || !canvas) return;
-
       ctx.clearRect(0, 0, canvas.width, canvas.height);
 
       const results = latestResultsRef.current;
@@ -215,7 +408,7 @@ export default function FaceSensePage() {
         const box = detection.box;
         const score = detection.score;
 
-        // ── Bounding box ─────────────────────────────────────────────────
+        // Bounding box
         ctx.strokeStyle = "#00f5d4";
         ctx.lineWidth = 2;
         ctx.shadowColor = "#00f5d4";
@@ -223,54 +416,52 @@ export default function FaceSensePage() {
         ctx.strokeRect(box.x, box.y, box.width, box.height);
         ctx.shadowBlur = 0;
 
-        // ── Corner accents ───────────────────────────────────────────────
+        // Corner accents
         drawCorners(ctx, box.x, box.y, box.width, box.height, 16, "#00f5d4");
 
-        // ── FIX 1: Confidence label — un-mirror canvas before drawing text
-        //
-        // The canvas has CSS transform: scaleX(-1) to mirror the video.
-        // That makes text appear backwards.  Solution: before drawing the label,
-        // flip the canvas CTM back to normal for just that draw call, then restore.
-        //
-        // The label is placed at the TOP-LEFT of the bounding box.
-        // In the mirrored canvas coordinate space, box.x is already the correct
-        // visual left edge — we just need to un-mirror around the canvas centre
-        // for the text drawing operation only.
-        const label = `FACE  ${(score * 100).toFixed(1)}%`;
+        // Confidence + emotion label (un-mirror for correct text rendering)
+        const emColor = EMOTION_COLORS[latestEmotionRef.current] ?? "#00f5d4";
+        const label = `FACE ${(score * 100).toFixed(1)}%  ${latestEmotionRef.current.toUpperCase()}`;
         ctx.font = "bold 13px monospace";
         const tw = ctx.measureText(label).width;
-        const lx = box.x;  // label x in canvas coords
-        const ly = box.y;  // label y in canvas coords
 
         ctx.save();
-        // Flip horizontally around the canvas centre so text appears correct
-        // in the mirrored CSS view
         ctx.scale(-1, 1);
         ctx.translate(-canvas.width, 0);
+        const ux = canvas.width - box.x - tw - 12;
 
-        // In the un-mirrored space, the x position of the label becomes:
-        const ux = canvas.width - lx - tw - 12; // mirror of lx
-
-        ctx.fillStyle = "rgba(0,0,0,0.72)";
-        ctx.fillRect(ux, ly - 24, tw + 12, 22);
-        ctx.fillStyle = "#00f5d4";
-        ctx.fillText(label, ux + 6, ly - 7);
+        ctx.fillStyle = "rgba(0,0,0,0.75)";
+        ctx.fillRect(ux, box.y - 24, tw + 12, 22);
+        ctx.fillStyle = emColor;
+        ctx.fillText(label, ux + 6, box.y - 7);
         ctx.restore();
 
-        // ── Landmark groups (drawn in normal mirrored coords — no text) ──
+        // Landmark groups (unchanged)
         const pts = landmarks.positions;
-        drawLandmarkGroup(ctx, pts.slice(0, 17),  "#4cc9f0", false); // jaw
-        drawLandmarkGroup(ctx, pts.slice(17, 22), "#f72585", false); // left brow
-        drawLandmarkGroup(ctx, pts.slice(22, 27), "#f72585", false); // right brow
-        drawLandmarkGroup(ctx, pts.slice(27, 31), "#4cc9f0", false); // nose bridge
-        drawLandmarkGroup(ctx, pts.slice(31, 36), "#4cc9f0", false); // nose tip
-        drawLandmarkGroup(ctx, pts.slice(36, 42), "#7209b7", true);  // left eye
-        drawLandmarkGroup(ctx, pts.slice(42, 48), "#7209b7", true);  // right eye
-        drawLandmarkGroup(ctx, pts.slice(48, 60), "#f72585", true);  // outer mouth
-        drawLandmarkGroup(ctx, pts.slice(60, 68), "#f72585", true);  // inner mouth
+        drawLandmarkGroup(ctx, pts.slice(0, 17),  "#4cc9f0", false);
+        drawLandmarkGroup(ctx, pts.slice(17, 22), "#f72585", false);
+        drawLandmarkGroup(ctx, pts.slice(22, 27), "#f72585", false);
+        drawLandmarkGroup(ctx, pts.slice(27, 31), "#4cc9f0", false);
+        drawLandmarkGroup(ctx, pts.slice(31, 36), "#4cc9f0", false);
+        drawLandmarkGroup(ctx, pts.slice(36, 42), "#7209b7", true);
+        drawLandmarkGroup(ctx, pts.slice(42, 48), "#7209b7", true);
+        drawLandmarkGroup(ctx, pts.slice(48, 60), "#f72585", true);
+        drawLandmarkGroup(ctx, pts.slice(60, 68), "#f72585", true);
+
+        // Blink indicator
+        if (eyeClosedRef.current) {
+          ctx.save();
+          ctx.scale(-1, 1);
+          ctx.translate(-canvas.width, 0);
+          ctx.font = "bold 11px monospace";
+          ctx.fillStyle = "#facc15";
+          const bx = canvas.width - box.x - box.width + 4;
+          ctx.fillText("● BLINK", bx, box.y + box.height + 16);
+          ctx.restore();
+        }
       });
 
-      // FPS counter — counts draw frames (reflects actual visual update rate)
+      // FPS counter
       const now = performance.now();
       fpsRef.current.frames++;
       if (now - fpsRef.current.last >= 1000) {
@@ -285,15 +476,18 @@ export default function FaceSensePage() {
     rafRef.current = requestAnimationFrame(draw);
   }, []);
 
-  // Cleanup on unmount
   useEffect(() => { return () => { stopCamera(); }; }, [stopCamera]);
 
   const isRunning = status === "detecting" || status === "no-face";
   const isLoading = status === "loading-models" || status === "requesting-camera";
 
-  // ── Render ────────────────────────────────────────────────────────────────
+  const stressPct = Math.round(stressScore * 100);
+  const stressColor =
+    stressPct >= 70 ? "#ef4444" : stressPct >= 40 ? "#f97316" : "#22c55e";
+
+  // ── Render ────────────────────────────────────────────────────────────────────
   return (
-    <main className="min-h-screen bg-[#0a0a0f] text-white flex flex-col items-center justify-start py-10 px-4">
+    <main className="min-h-screen bg-[#0a0a0f] text-white flex flex-col items-center justify-start py-10 px-4" suppressHydrationWarning>
 
       {/* Header */}
       <header className="mb-8 text-center select-none">
@@ -305,68 +499,147 @@ export default function FaceSensePage() {
           <div className="w-2 h-2 rounded-full bg-[#00f5d4] animate-pulse shadow-[0_0_8px_#00f5d4]" />
         </div>
         <p className="text-xs text-zinc-600 tracking-widest uppercase font-mono">
-          Phase 1 — Real-time Face Detection
+          Phase 2 — Emotion · Stress · Blink Detection
         </p>
       </header>
 
-      {/* Video + Canvas */}
-      <div className="relative w-full max-w-3xl">
-        <div className={`rounded-xl overflow-hidden border transition-all duration-500 ${
-          isRunning
-            ? "border-[#00f5d4]/30 shadow-[0_0_40px_rgba(0,245,212,0.1)]"
-            : "border-zinc-800"
-        }`}>
-          <video
-            ref={videoRef}
-            autoPlay muted playsInline
-            className="w-full block bg-zinc-950"
-            style={{ transform: "scaleX(-1)", minHeight: "360px" }}
-          />
-          {/*
-           * Canvas is absolutely positioned on top of the video.
-           * Both share scaleX(-1) so drawings register correctly on the mirrored video.
-           * Text is re-flipped per-label inside the draw loop (Fix 1).
-           */}
-          <canvas
-            ref={canvasRef}
-            className="absolute inset-0 w-full h-full pointer-events-none"
-            style={{ transform: "scaleX(-1)" }}
-          />
+      {/* Alerts */}
+      {(alertStress || alertBlink) && (
+        <div className="mb-4 w-full max-w-5xl flex flex-col gap-2">
+          {alertStress && (
+            <div className="flex items-center gap-3 bg-red-950/60 border border-red-500/50 rounded-lg px-4 py-3 text-red-400 text-sm font-mono animate-pulse">
+              <span className="text-lg">⚠</span>
+              <span>HIGH STRESS DETECTED — sustained stress for 10+ seconds. Take a break.</span>
+            </div>
+          )}
+          {alertBlink && (
+            <div className="flex items-center gap-3 bg-amber-950/60 border border-amber-500/50 rounded-lg px-4 py-3 text-amber-400 text-sm font-mono">
+              <span className="text-lg">👁</span>
+              <span>LOW BLINK RATE ({blinkRate}/min) — blink more often to reduce eye strain.</span>
+            </div>
+          )}
+        </div>
+      )}
 
-          {/* Idle placeholder */}
-          {!isRunning && !isLoading && (
-            <div className="absolute inset-0 flex flex-col items-center justify-center bg-zinc-950/95 min-h-[360px]">
-              <CameraOffIcon />
-              <p className="mt-4 text-zinc-600 text-sm font-mono tracking-widest uppercase">
-                Press &ldquo;Start Camera&rdquo; to begin
-              </p>
+      {/* Main layout */}
+      <div className="w-full max-w-5xl flex flex-col xl:flex-row gap-4">
+
+        {/* Video + Canvas */}
+        <div className="relative flex-1">
+          <div className={`rounded-xl overflow-hidden border transition-all duration-500 ${
+            isRunning
+              ? alertStress
+                ? "border-red-500/50 shadow-[0_0_40px_rgba(239,68,68,0.2)]"
+                : "border-[#00f5d4]/30 shadow-[0_0_40px_rgba(0,245,212,0.1)]"
+              : "border-zinc-800"
+          }`}>
+            <video
+              ref={videoRef}
+              autoPlay muted playsInline
+              className="w-full block bg-zinc-950"
+              style={{ transform: "scaleX(-1)", minHeight: "360px" }}
+            />
+            <canvas
+              ref={canvasRef}
+              className="absolute inset-0 w-full h-full pointer-events-none"
+              style={{ transform: "scaleX(-1)" }}
+            />
+
+            {!isRunning && !isLoading && (
+              <div className="absolute inset-0 flex flex-col items-center justify-center bg-zinc-950/95 min-h-[360px]">
+                <CameraOffIcon />
+                <p className="mt-4 text-zinc-600 text-sm font-mono tracking-widest uppercase">
+                  Press &ldquo;Start Camera&rdquo; to begin
+                </p>
+              </div>
+            )}
+
+            {isLoading && (
+              <div className="absolute inset-0 flex flex-col items-center justify-center bg-zinc-950/85 min-h-[360px]">
+                <Spinner />
+                <p className="mt-4 text-amber-400 text-sm font-mono tracking-widest animate-pulse">
+                  {STATUS_LABELS[status]}
+                </p>
+              </div>
+            )}
+          </div>
+
+          {isRunning && (
+            <div className="absolute top-3 right-3 flex flex-col gap-1.5 items-end pointer-events-none">
+              <HudBadge color="#00f5d4" label="FACES" value={String(faceCount)} />
+              <HudBadge color="#7209b7" label="FPS"   value={String(fps)} />
             </div>
           )}
 
-          {/* Loading overlay */}
-          {isLoading && (
-            <div className="absolute inset-0 flex flex-col items-center justify-center bg-zinc-950/85 min-h-[360px]">
-              <Spinner />
-              <p className="mt-4 text-amber-400 text-sm font-mono tracking-widest animate-pulse">
-                {STATUS_LABELS[status]}
-              </p>
+          {isRunning && (
+            <div className="absolute top-3 left-3 flex items-center gap-1.5 bg-black/60 border border-red-500/30 rounded px-2 py-1 pointer-events-none backdrop-blur-sm">
+              <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
+              <span className="text-red-400 text-xs font-mono font-bold tracking-widest">LIVE</span>
             </div>
           )}
         </div>
 
-        {/* HUD — top right */}
+        {/* ── Analytics Panel ─────────────────────────────────────────────── */}
         {isRunning && (
-          <div className="absolute top-3 right-3 flex flex-col gap-1.5 items-end pointer-events-none">
-            <HudBadge color="#00f5d4" label="FACES" value={String(faceCount)} />
-            <HudBadge color="#7209b7" label="FPS"   value={String(fps)} />
-          </div>
-        )}
+          <div className="xl:w-64 flex flex-col gap-3">
 
-        {/* LIVE badge — top left */}
-        {isRunning && (
-          <div className="absolute top-3 left-3 flex items-center gap-1.5 bg-black/60 border border-red-500/30 rounded px-2 py-1 pointer-events-none backdrop-blur-sm">
-            <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
-            <span className="text-red-400 text-xs font-mono font-bold tracking-widest">LIVE</span>
+            {/* Emotion card */}
+            <div className="bg-zinc-900/70 border border-zinc-800 rounded-xl p-4">
+              <p className="text-[10px] font-mono text-zinc-500 uppercase tracking-widest mb-2">Emotion</p>
+              <div className="flex items-center gap-3">
+                <span className="text-3xl">{EMOTION_EMOJI[emotion] ?? "😐"}</span>
+                <div>
+                  <p className="text-lg font-bold font-mono capitalize" style={{ color: EMOTION_COLORS[emotion] ?? "#fff" }}>
+                    {emotion}
+                  </p>
+                  <p className="text-xs text-zinc-600 font-mono">dominant</p>
+                </div>
+              </div>
+            </div>
+
+            {/* Stress card */}
+            <div className="bg-zinc-900/70 border border-zinc-800 rounded-xl p-4">
+              <div className="flex items-center justify-between mb-2">
+                <p className="text-[10px] font-mono text-zinc-500 uppercase tracking-widest">Stress Level</p>
+                <p className="text-sm font-bold font-mono" style={{ color: stressColor }}>{stressPct}%</p>
+              </div>
+              <div className="w-full h-2.5 bg-zinc-800 rounded-full overflow-hidden">
+                <div className="h-full rounded-full transition-all duration-500" style={{ width: `${stressPct}%`, backgroundColor: stressColor }} />
+              </div>
+              <p className="text-[10px] font-mono text-zinc-600 mt-1.5">
+                {stressPct >= 70 ? "HIGH — take a break" : stressPct >= 40 ? "MODERATE" : "LOW — calm"}
+              </p>
+            </div>
+
+            {/* Blink card */}
+            <div className="bg-zinc-900/70 border border-zinc-800 rounded-xl p-4">
+              <p className="text-[10px] font-mono text-zinc-500 uppercase tracking-widest mb-3">Blink Stats</p>
+              <div className="grid grid-cols-2 gap-2">
+                <div className="bg-zinc-950/60 rounded-lg p-2 text-center">
+                  <p className="text-lg font-bold font-mono text-[#00f5d4]">{blinkRate}</p>
+                  <p className="text-[10px] font-mono text-zinc-600">/min</p>
+                </div>
+                <div className="bg-zinc-950/60 rounded-lg p-2 text-center">
+                  <p className="text-lg font-bold font-mono text-[#7209b7]">{blinkCount}</p>
+                  <p className="text-[10px] font-mono text-zinc-600">total</p>
+                </div>
+              </div>
+              {alertBlink && <p className="text-[10px] font-mono text-amber-400 mt-2">⚠ Rate too low (&lt;8/min)</p>}
+            </div>
+
+            {/* Backend status */}
+            <div className="bg-zinc-900/70 border border-zinc-800 rounded-xl p-3 flex items-center gap-2">
+              <span className="w-2 h-2 rounded-full flex-shrink-0" style={{
+                backgroundColor: backendOk === null ? "#6b7280" : backendOk ? "#22c55e" : "#ef4444"
+              }} />
+              <div>
+                <p className="text-[10px] font-mono text-zinc-500 uppercase tracking-widest">Backend</p>
+                <p className="text-xs font-mono text-zinc-400">
+                  {backendOk === null ? "waiting…" : backendOk ? "connected ✓" : "offline (data not saved)"}
+                </p>
+              </div>
+            </div>
+
           </div>
         )}
       </div>
@@ -406,9 +679,10 @@ export default function FaceSensePage() {
       </div>
 
       {/* Info cards */}
-      <div className="mt-10 grid grid-cols-3 gap-4 w-full max-w-xl text-center">
+      <div className="mt-10 grid grid-cols-2 sm:grid-cols-4 gap-3 w-full max-w-2xl text-center">
         {[
           { label: "Detection Model", value: "SSD MobileNet v1" },
+          { label: "Emotion Model",   value: "Expression Net" },
           { label: "Landmark Points", value: "68 Points" },
           { label: "Processing",      value: "Client-side" },
         ].map(({ label, value }) => (
@@ -430,14 +704,31 @@ export default function FaceSensePage() {
       )}
 
       <footer className="mt-12 text-zinc-800 text-xs font-mono text-center">
-        FaceSense Phase 1 · face-api.js · SSD MobileNet v1 · No backend
+        FaceSense Phase 2 · face-api.js · Emotion · Stress · Blink · Express + MongoDB
       </footer>
     </main>
   );
 }
 
-// ─── Canvas drawing helpers ───────────────────────────────────────────────────
+// ─── Audio beep helper ─────────────────────────────────────────────────────────
+function playBeep(freq = 880, duration = 0.2) {
+  try {
+    const ctx = new AudioContext();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.3, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration);
+    osc.start(ctx.currentTime);
+    osc.stop(ctx.currentTime + duration);
+  } catch {
+    // AudioContext not available — skip
+  }
+}
 
+// ─── Canvas helpers (unchanged from Phase 1) ──────────────────────────────────
 function drawCorners(
   ctx: CanvasRenderingContext2D,
   x: number, y: number, w: number, h: number,
@@ -492,8 +783,7 @@ function drawLandmarkGroup(
   });
 }
 
-// ─── UI sub-components ────────────────────────────────────────────────────────
-
+// ─── UI sub-components (unchanged from Phase 1) ───────────────────────────────
 function CameraOffIcon() {
   return (
     <svg width="52" height="52" viewBox="0 0 52 52" fill="none" className="text-zinc-800">
