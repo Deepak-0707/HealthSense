@@ -1,222 +1,213 @@
-# 🧠 FaceSense — Phase 1: Real-time Face Detection
+# FaceSense — Phase 2
 
-A fully **client-side**, browser-based face detection system built with Next.js, React, Tailwind CSS, and face-api.js.
-
-**No backend. No paid APIs. No data leaves your device.**
+Real-time face analytics: **emotion detection**, **stress estimation**, **blink rate tracking**, and a persistent backend.
 
 ---
 
-## ✨ What It Does
+## What's New in Phase 2
 
 | Feature | Details |
 |---|---|
-| 📷 Webcam access | `navigator.mediaDevices.getUserMedia` |
-| 🔍 Face detection | SSD MobileNet v1 via face-api.js |
-| 🗺 Facial landmarks | 68-point overlay (jaw, eyes, brows, nose, mouth) |
-| 📦 Model loading | Served locally from `/public/models/` |
-| ⚡ Rendering | `requestAnimationFrame` loop — ~20–30 fps |
-| 🛡 Privacy | Zero data sent anywhere — runs 100% in your browser |
+| Emotion detection | 7 classes via `faceExpressionNet` (happy, sad, angry, fearful, disgusted, surprised, neutral) |
+| Stress score | Weighted emotion → 0–100% bar, colour-coded green/orange/red |
+| Blink detection | Eye Aspect Ratio (EAR) on landmarks 36–47 |
+| Blink rate alert | Warning if < 8 blinks/min after first 30 s |
+| Stress alert | Red UI flash + audio beep if stress > 70% for 10+ seconds |
+| Analytics panel | Live sidebar: emotion emoji, stress bar, blink stats, backend status |
+| Express backend | Node.js + Express on port 5000 |
+| MongoDB Atlas | Session snapshots saved every 3 s |
+| REST API | `POST /api/session`, `GET /api/session`, `GET /api/session/stats` |
+
+All Phase 1 features (face detection, landmarks, canvas, FPS HUD, mirrored label fix) are **unchanged**.
 
 ---
 
-## 🚀 Quick Start
+## Folder Structure
 
-### 1. Clone or unzip the project
-
-```bash
-cd facesense-phase1
+```
+facesense-phase2/
+├── app/
+│   ├── page.tsx              ← Phase 2 frontend (extended)
+│   ├── layout.tsx
+│   └── globals.css
+├── public/
+│   └── models/               ← model weights (downloaded by script)
+├── scripts/
+│   └── download-models.js    ← updated: now downloads expression model too
+├── server/                   ← NEW — Express backend
+│   ├── config/
+│   │   └── db.js
+│   ├── models/
+│   │   └── Session.js
+│   ├── routes/
+│   │   └── sessionRoutes.js
+│   ├── index.js
+│   ├── package.json
+│   └── .env.example
+├── .env.local.example
+├── package.json
+└── README.md
 ```
 
-### 2. Install dependencies
+---
+
+## Quick Start
+
+### 1. Install frontend dependencies
 
 ```bash
 npm install
 ```
 
-### 3. Download model weights *(one-time setup)*
+### 2. Download all model weights (Phase 1 + Phase 2)
 
 ```bash
 node scripts/download-models.js
 ```
 
-This downloads ~6 MB of model files from GitHub into `public/models/`.
+Downloads ~12 MB into `public/models/`. Run only once; skips existing files.
 
-### 4. Start the development server
+### 3. Set up the backend
 
 ```bash
+cd server
+npm install
+cp .env.example .env
+# Edit .env — paste your MongoDB Atlas connection string
+```
+
+### 4. Set frontend env (optional — defaults to localhost:5000)
+
+```bash
+# project root
+cp .env.local.example .env.local
+```
+
+### 5. Run both servers (two terminals)
+
+**Terminal 1 — Backend:**
+```bash
+cd server
+npm start        # or: npm run dev  (nodemon)
+```
+
+**Terminal 2 — Frontend:**
+```bash
+# project root
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000)
+Open **http://localhost:3000**
 
 ---
 
-## 📁 Project Structure
+## MongoDB Atlas Setup
 
-```
-facesense-phase1/
-├── app/
-│   ├── page.tsx          ← Main face detection UI + logic
-│   ├── layout.tsx        ← HTML shell + metadata
-│   └── globals.css       ← Base styles + Tailwind
-│
-├── public/
-│   └── models/           ← face-api.js weight files (downloaded separately)
-│       ├── .gitkeep
-│       ├── ssd_mobilenetv1_model-weights_manifest.json
-│       ├── ssd_mobilenetv1_model-shard1
-│       ├── face_landmark_68_model-weights_manifest.json
-│       └── face_landmark_68_model-shard1
-│
-├── scripts/
-│   └── download-models.js  ← One-time model weight downloader
-│
-├── next.config.ts          ← Webpack fs-fallback for face-api.js
-├── tailwind.config.ts      ← Tailwind config
-├── tsconfig.json           ← TypeScript config
-└── package.json
+1. Sign in at [https://cloud.mongodb.com](https://cloud.mongodb.com) (free account)
+2. Create a **free M0 cluster**
+3. **Security → Database Access** → add a user with Read/Write permissions
+4. **Security → Network Access** → add `0.0.0.0/0` for local dev
+5. **Connect → Drivers → Node.js** → copy the connection string
+6. Paste into `server/.env`:
+
+```env
+MONGO_URI=mongodb+srv://myuser:mypassword@cluster0.abcde.mongodb.net/facesense?retryWrites=true&w=majority
+PORT=5000
 ```
 
 ---
 
-## 🧩 Architecture
+## API Reference
 
-```
-Browser
-  │
-  ├── MediaDevices API ──► <video> element (mirrored)
-  │                              │
-  │                              ▼
-  ├── face-api.js ──► detectAllFaces().withFaceLandmarks()
-  │       │
-  │       ├── SSD MobileNet v1   (face bounding boxes)
-  │       └── FaceLandmark68Net  (68 facial keypoints)
-  │
-  └── Canvas 2D API ──► draws boxes + landmarks each frame
+Base URL: `http://localhost:5000`
+
+### `GET /health`
+```json
+{ "status": "ok", "timestamp": "2024-01-01T00:00:00.000Z" }
 ```
 
----
+### `POST /api/session`
+Save one analytics snapshot.
 
-## 🎨 UI Features
+**Body:**
+```json
+{
+  "emotion": "neutral",
+  "stressScore": 0.12,
+  "blinkRate": 14,
+  "timestamp": "2024-01-01T00:00:00.000Z"
+}
+```
+**Response 201:**
+```json
+{ "success": true, "id": "66a1b2c3..." }
+```
 
-- **Dark terminal aesthetic** — `#0a0a0f` background, neon cyan accents
-- **Live HUD** — face count + FPS counter overlaid on feed
-- **LIVE badge** — red pulsing indicator when camera is active  
-- **Status states** — Camera Off / Loading Models / Requesting Camera / Detecting / No Face / Error
-- **Color-coded landmarks**:
-  - 🩵 Cyan — jaw line, nose bridge
-  - 💜 Purple — eyes
-  - 💗 Pink — eyebrows, mouth
+### `GET /api/session`
 
----
-
-## 🧠 Models Used
-
-| Model | Purpose | Size |
+| Query | Default | Description |
 |---|---|---|
-| `ssd_mobilenetv1` | Detects face bounding boxes | ~5.4 MB |
-| `faceLandmark68Net` | Predicts 68 facial landmarks | ~350 KB |
-
-Both are open-source and hosted on the [official face-api.js GitHub](https://github.com/justadudewhohacks/face-api.js).
-
----
-
-## 🌐 Deploy to Vercel (Free)
+| `limit` | 100 | Max records (cap 500) |
+| `since` | — | ISO datetime filter |
 
 ```bash
-# 1. Push to GitHub
-git init
-git add .
-git commit -m "FaceSense Phase 1"
-git remote add origin https://github.com/YOUR_USERNAME/facesense-phase1.git
-git push -u origin main
-
-# 2. Import at https://vercel.com/new
-# 3. Click Deploy — no configuration needed
+curl "http://localhost:5000/api/session?limit=20"
 ```
 
-> ⚠️ **Important**: Run `node scripts/download-models.js` **before** pushing, so `public/models/` is committed and included in the Vercel build.
+### `GET /api/session/stats`
 
----
-
-## 🛠 Troubleshooting
-
-### ❌ "Model load failed"
-
-```
-Model load failed: Failed to fetch
-```
-
-**Cause**: Model files missing from `public/models/`.
-
-**Fix**:
 ```bash
-node scripts/download-models.js
+curl "http://localhost:5000/api/session/stats"
+```
+```json
+{
+  "summary": { "avgStress": 0.18, "maxStress": 0.71, "avgBlinkRate": 13, "count": 48 },
+  "emotionBreakdown": [
+    { "_id": "neutral", "count": 30 },
+    { "_id": "happy",   "count": 12 }
+  ]
+}
 ```
 
 ---
 
-### ❌ Camera permission denied
+## Manual API Test
 
-**Cause**: Browser blocked camera access.
-
-**Fix**:
-1. Click the camera icon in your browser's address bar
-2. Select "Allow" for camera
-3. Refresh the page and try again
-
-On macOS: System Settings → Privacy & Security → Camera → enable for your browser.
-
----
-
-### ❌ No face detected / orange status
-
-**Cause**: Face not clearly visible or confidence < 50%.
-
-**Fix**:
-- Ensure good lighting (face the light source, don't backlight yourself)
-- Move closer to camera
-- Avoid covering your face
-
----
-
-### ❌ Low FPS / choppy detection
-
-**Cause**: Older CPU or heavy browser load.
-
-**Fix**:
-- Close other browser tabs
-- Detection runs on CPU — no GPU required but benefits from a fast CPU
-- Typical performance: ~20–30 fps on modern hardware
-
----
-
-### ❌ TypeScript errors on `faceapi.Point`
-
-**Cause**: face-api.js typings version mismatch.
-
-**Fix**:
 ```bash
-npm install face-api.js@latest
+# Health
+curl http://localhost:5000/health
+
+# Post a test record
+curl -X POST http://localhost:5000/api/session \
+  -H "Content-Type: application/json" \
+  -d '{"emotion":"happy","stressScore":0.08,"blinkRate":15}'
+
+# Fetch records
+curl "http://localhost:5000/api/session?limit=5"
+
+# Aggregated stats
+curl "http://localhost:5000/api/session/stats"
 ```
 
 ---
 
-## 🔮 Phase 2 (Coming Next)
+## Alert Thresholds
 
-Phase 2 will add:
-- 😊 Emotion detection (happy, sad, angry, surprised, neutral, fearful, disgusted)
-- 📊 Confidence scores per emotion
-- Real-time emotion history graph
+| Alert | Condition | UI |
+|---|---|---|
+| High Stress | > 70% for 10+ seconds | Red border + banner + 880 Hz beep |
+| Low Blink Rate | < 8/min after 30 s | Amber banner |
 
 ---
 
-## 📄 License
+## Offline Behaviour
 
-MIT — free for personal and commercial use.
+The frontend works without the backend. If the server is unreachable the Backend indicator turns red and sessions are simply not saved — detection continues normally.
 
-Built with:
-- [Next.js](https://nextjs.org) — React framework
-- [face-api.js](https://github.com/justadudewhohacks/face-api.js) — Face detection in the browser
-- [Tailwind CSS](https://tailwindcss.com) — Utility-first CSS
-- [Vercel](https://vercel.com) — Free hosting
+---
+
+## Performance
+
+- Inference: **150 ms** interval (~6–7 fps) — smooth, CPU-friendly
+- Canvas draw: **60 fps** via requestAnimationFrame — decoupled from inference
+- API posts: **every 3 s** — not every frame
