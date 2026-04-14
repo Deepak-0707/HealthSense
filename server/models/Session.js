@@ -1,19 +1,29 @@
 const mongoose = require("mongoose");
 
 /**
- * Session — one analytics snapshot every ~3 seconds while camera is active.
+ * Session — one analytics snapshot every ~5 seconds while camera is active.
  *
- * Fields:
- *   timestamp  — ISO string from the client (when the snapshot was taken)
- *   emotion    — dominant emotion label (happy | sad | angry | fearful | disgusted | surprised | neutral)
- *   stressScore — 0.0 – 1.0  (computed from emotion weights on the client)
- *   blinkRate  — blinks per minute (rolling, computed since session start)
+ * Phase 3 additions:
+ *   userId     — persistent user identity (UUID from localStorage)
+ *   sessionId  — per-camera-session UUID
+ *   + indexes on userId, sessionId, timestamp
  */
 const SessionSchema = new mongoose.Schema(
   {
+    userId: {
+      type: String,
+      required: true,
+      index: true,
+    },
+    sessionId: {
+      type: String,
+      required: true,
+      index: true,
+    },
     timestamp: {
       type: Date,
       default: Date.now,
+      index: true,
     },
     emotion: {
       type: String,
@@ -33,11 +43,11 @@ const SessionSchema = new mongoose.Schema(
     },
   },
   {
-    // Automatically adds createdAt / updatedAt
     timestamps: true,
-    // Keep the collection name explicit
     collection: "sessions",
   }
 );
+
+SessionSchema.index({ userId: 1, timestamp: -1 });
 
 module.exports = mongoose.model("Session", SessionSchema);

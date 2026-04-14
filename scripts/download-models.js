@@ -1,67 +1,63 @@
 #!/usr/bin/env node
-const https = require("https");
-const http  = require("http");
-const fs    = require("fs");
-const path  = require("path");
+/**
+ * FaceSense Phase 3 — Model Weight Downloader
+ *
+ * Source: @vladmandic/face-api CDN (jsdelivr)
+ * Run: node scripts/download-models.js
+ * Force re-download: node scripts/download-models.js --force
+ */
 
-// Primary + fallback sources
-const BASE_URLS = [
-  "https://raw.githubusercontent.com/justadudewhohacks/face-api.js/master/weights",
-  "https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js/weights"
-];
+const https = require("https");
+const fs = require("fs");
+const path = require("path");
+
+const FORCE = process.argv.includes("--force");
+
+const BASE_URL = "https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/";
 
 const OUT_DIR = path.join(__dirname, "..", "public", "models");
 
 const FILES = [
-  // Phase 1
+  // Face detection
   "ssd_mobilenetv1_model-weights_manifest.json",
   "ssd_mobilenetv1_model-shard1",
   "ssd_mobilenetv1_model-shard2",
+
+  // Landmarks
   "face_landmark_68_model-weights_manifest.json",
   "face_landmark_68_model-shard1",
 
-  // Phase 2 (FIXED)
+  // Emotion (note: vladmandic uses face_expression_model, NOT face_expression_recognition_model)
   "face_expression_model-weights_manifest.json",
   "face_expression_model-shard1",
+
+  // Face recognition / descriptors (Phase 3 KNN)
+  "face_recognition_model-weights_manifest.json",
+  "face_recognition_model-shard1",
 ];
 
 if (!fs.existsSync(OUT_DIR)) {
   fs.mkdirSync(OUT_DIR, { recursive: true });
-  console.log("Created directory: " + OUT_DIR);
+  console.log("Created: " + OUT_DIR);
 }
 
-function fetchWithFallback(filename, attempt = 0) {
+function downloadFile(filename) {
   return new Promise((resolve, reject) => {
-    if (attempt >= BASE_URLS.length) {
-      return reject(new Error("All sources failed"));
+    const dest = path.join(OUT_DIR, filename);
+
+    if (!FORCE && fs.existsSync(dest) && fs.statSync(dest).size > 0) {
+      console.log("↩  Skipping (exists): " + filename);
+      return resolve();
     }
 
-    const url = BASE_URLS[attempt] + "/" + filename;
-    const dest = path.join(OUT_DIR, filename);
     const tmpDest = dest + ".tmp";
+    const file = fs.createWriteStream(tmpDest);
 
-    const lib = url.startsWith("https") ? https : http;
-
-    console.log(`   ⬇ Downloading ${filename} (source ${attempt + 1})...`);
-
-    lib.get(url, (res) => {
+    https.get(BASE_URL + filename, (res) => {
       if (res.statusCode !== 200) {
-        console.log(`   ↻ Switching source for ${filename}`);
-        return resolve(fetchWithFallback(filename, attempt + 1));
+        fs.unlink(tmpDest, () => {});
+        return reject(new Error("HTTP " + res.statusCode + " for " + filename));
       }
-
-      const totalBytes = parseInt(res.headers["content-length"] || "0", 10);
-      let downloaded = 0;
-
-      const file = fs.createWriteStream(tmpDest);
-
-      res.on("data", (chunk) => {
-        downloaded += chunk.length;
-        if (totalBytes) {
-          const pct = ((downloaded / totalBytes) * 100).toFixed(0);
-          process.stdout.write(`\r   ⬇ ${filename} — ${pct}%   `);
-        }
-      });
 
       res.pipe(file);
 
@@ -69,51 +65,39 @@ function fetchWithFallback(filename, attempt = 0) {
         file.close(() => {
           fs.renameSync(tmpDest, dest);
           const kb = (fs.statSync(dest).size / 1024).toFixed(1);
-          process.stdout.write(`\r   ✓ ${filename} (${kb} KB)\n`);
+          console.log("✓  Downloaded: " + filename + " (" + kb + " KB)");
           resolve();
         });
       });
-
-      file.on("error", (err) => {
-        fs.unlink(tmpDest, () => {});
-        reject(err);
-      });
-
-    }).on("error", () => {
-      if (fs.existsSync(tmpDest)) fs.unlink(tmpDest, () => {});
-      resolve(fetchWithFallback(filename, attempt + 1));
+    }).on("error", (err) => {
+      fs.unlink(tmpDest, () => {});
+      reject(err);
     });
   });
 }
 
 (async () => {
-  console.log("\n🧠 FaceSense Phase 2 — Downloading face-api.js model weights");
-  console.log("    Output: " + OUT_DIR + "\n");
+  console.log("\n🧠  FaceSense Phase 3 — Downloading model weights");
+  console.log("    Source: " + BASE_URL);
+  if (FORCE) console.log("    Mode: --force (re-downloading all)\n");
+  else console.log("");
 
   let failed = 0;
 
   for (const file of FILES) {
-    const dest = path.join(OUT_DIR, file);
-
-    if (fs.existsSync(dest) && fs.statSync(dest).size > 0) {
-      console.log("   ↩ Already exists, skipping: " + file);
-      continue;
-    }
-
     try {
-      await fetchWithFallback(file);
+      await downloadFile(file);
     } catch (err) {
-      console.error("\n   ✗ Failed: " + file);
-      console.error("      " + err.message + "\n");
+      console.error("✗  Failed: " + file + " — " + err.message);
       failed++;
     }
   }
 
   console.log("");
   if (failed > 0) {
-    console.error(`❌ ${failed} file(s) failed.`);
+    console.error("❌  " + failed + " file(s) failed. Retry or check your connection.\n");
     process.exit(1);
   } else {
-    console.log("✅ All models ready (Phase 1 + Phase 2). Run: npm run dev\n");
+    console.log("✅  All models ready! Run: npm run dev\n");
   }
 })();
