@@ -1265,7 +1265,7 @@ function drawCorners(
 
 function drawLandmarkGroup(
   ctx: CanvasRenderingContext2D,
-  points: faceapi.Point[],
+  points: FaceAPI.Point[],
   color: string,
   close: boolean
 ) {
