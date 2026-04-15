@@ -2,9 +2,9 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "FaceSense — Real-time Face Detection",
+  title: "FaceSense — AI Wellness Monitor",
   description:
-    "Phase 1: Browser-based real-time face detection using face-api.js. No backend, fully client-side.",
+    "Phase 4: Production-ready stress, fatigue & emotion detection. Real-time notifications, analytics dashboard, MongoDB Atlas.",
 };
 
 export default function RootLayout({
@@ -18,6 +18,26 @@ export default function RootLayout({
      * one level of attribute differences, not child content mismatches.
      */
     <html lang="en">
+      <head>
+        {/* Register service worker for optional background push notifications */}
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `
+              if ('serviceWorker' in navigator) {
+                window.addEventListener('load', function() {
+                  navigator.serviceWorker.register('/sw.js')
+                    .then(function(reg) {
+                      console.log('[FaceSense] SW registered, scope:', reg.scope);
+                    })
+                    .catch(function(err) {
+                      console.log('[FaceSense] SW registration failed:', err);
+                    });
+                });
+              }
+            `,
+          }}
+        />
+      </head>
       <body suppressHydrationWarning>{children}</body>
     </html>
   );

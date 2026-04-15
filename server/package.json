@@ -1,7 +1,7 @@
 {
   "name": "facesense-server",
   "version": "1.0.0",
-  "description": "FaceSense Phase 2 — Express + MongoDB backend",
+  "description": "FaceSense Phase 4 — Express + MongoDB backend",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
