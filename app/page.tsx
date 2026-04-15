@@ -1,4 +1,4 @@
-"use client";
+  "use client";
 
 /**
  * FaceSense Phase 4 — Production-Ready · Notifications · Dashboard Link
@@ -15,6 +15,7 @@
 
 import { useEffect, useRef, useCallback, useState } from "react";
 import Link from "next/link";
+import type * as faceapiTypes from "@vladmandic/face-api";
 
 // @vladmandic/face-api uses browser APIs — must not be imported at module level
 // during SSR. We load it lazily inside useEffect (client-only).
