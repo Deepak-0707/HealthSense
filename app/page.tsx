@@ -125,7 +125,7 @@ function euclideanDesc(a: number[], b: number[]): number {
   return Math.sqrt(sum);
 }
 
-function eyeAspectRatio(pts: faceapi.Point[]): number {
+function eyeAspectRatio(pts: FaceAPI.Point[]): number {
   const A = euclidean(pts[1], pts[5]);
   const B = euclidean(pts[2], pts[4]);
   const C = euclidean(pts[0], pts[3]);
