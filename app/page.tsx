@@ -1,27 +1,36 @@
 "use client";
 
 /**
- * FaceSense Phase 2 — Emotion · Stress · Blink Detection
+ * FaceSense Phase 3 — Personalized AI · Session Management · Adaptive Thresholds
  *
- * Phase 1 features preserved:
- *   ✓ Webcam streaming
- *   ✓ Face detection (SSD MobileNet v1)
- *   ✓ 68-point landmark detection
- *   ✓ Canvas rendering with mirrored-label fix
- *   ✓ willReadFrequently optimisation
- *   ✓ Decoupled inference / draw loops
+ * Phase 1 features preserved: ✓ webcam, face detection, canvas rendering, landmarks
+ * Phase 2 features preserved: ✓ emotion, stress, blink detection, alerts, backend POST
  *
- * Phase 2 additions:
- *   + Emotion detection via faceExpressionNet
- *   + Stress score derived from emotion weights
- *   + Blink detection via Eye Aspect Ratio (EAR)
- *   + Alert system (stress > 0.7 for 10 s, blink rate < 8 /min)
- *   + Analytics panel (emotion, stress bar, blink rate)
- *   + Backend POST every 3 s (non-blocking, gracefully offline)
+ * Phase 3 additions:
+ *   + User identity (UUID → localStorage)
+ *   + Session management (per-camera-run sessionId)
+ *   + Baseline calibration (30s window on session start)
+ *   + Adaptive thresholds (stressThreshold, blinkThreshold)
+ *   + KNN training mode (relaxed / stressed samples)
+ *   + KNN classification using Euclidean distance
+ *   + Alert cooldown (30s minimum gap)
+ *   + API batching (buffer → flush every 5s)
+ *   + Input validation + error handling / fallbacks
  */
 
 import { useEffect, useRef, useCallback, useState } from "react";
-import * as faceapi from "face-api.js";
+import type * as FaceAPI from "@vladmandic/face-api";
+
+// @vladmandic/face-api uses browser APIs — must not be imported at module level
+// during SSR. We load it lazily inside useEffect (client-only).
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let faceapi: any = null;
+async function getFaceApi() {
+  if (!faceapi) {
+    faceapi = await import("@vladmandic/face-api");
+  }
+  return faceapi;
+}
 
 // ─── Types ─────────────────────────────────────────────────────────────────────
 type Status =
@@ -29,6 +38,7 @@ type Status =
   | "loading-models"
   | "models-ready"
   | "requesting-camera"
+  | "calibrating"
   | "detecting"
   | "no-face"
   | "error";
@@ -38,6 +48,7 @@ const STATUS_LABELS: Record<Status, string> = {
   "loading-models": "Loading Models…",
   "models-ready": "Models Ready",
   "requesting-camera": "Requesting Camera…",
+  calibrating: "Calibrating (30s)…",
   detecting: "Detecting Face…",
   "no-face": "No Face Detected",
   error: "Error — See Below",
@@ -48,15 +59,30 @@ const STATUS_COLORS: Record<Status, string> = {
   "loading-models": "text-amber-400",
   "models-ready": "text-sky-400",
   "requesting-camera": "text-amber-400",
+  calibrating: "text-purple-400",
   detecting: "text-emerald-400",
   "no-face": "text-orange-400",
   error: "text-red-400",
 };
 
 type FaceResult = {
-  detection: faceapi.FaceDetection;
-  landmarks: faceapi.FaceLandmarks68;
-  expressions: faceapi.FaceExpressions;
+  detection: FaceAPI.FaceDetection;
+  landmarks: FaceAPI.FaceLandmarks68;
+  expressions: FaceAPI.FaceExpressions;
+  descriptor?: Float32Array;
+};
+
+type TrainLabel = "relaxed" | "stressed";
+type TrainPhase = "idle" | "relaxed" | "stressed" | "done";
+
+type KNNSample = {
+  descriptor: number[];
+  label: TrainLabel;
+};
+
+type Baseline = {
+  avgStress: number;
+  avgBlinkRate: number;
 };
 
 // Stress weights per emotion (0 = calm, 1 = max stress)
@@ -71,50 +97,51 @@ const STRESS_WEIGHTS: Record<string, number> = {
 };
 
 const EMOTION_EMOJI: Record<string, string> = {
-  angry: "😠",
-  disgusted: "🤢",
-  fearful: "😨",
-  sad: "😢",
-  surprised: "😲",
-  neutral: "😐",
-  happy: "😊",
+  angry: "😠", disgusted: "🤢", fearful: "😨",
+  sad: "😢", surprised: "😲", neutral: "😐", happy: "😊",
 };
 
 const EMOTION_COLORS: Record<string, string> = {
-  angry: "#ef4444",
-  disgusted: "#a855f7",
-  fearful: "#f97316",
-  sad: "#3b82f6",
-  surprised: "#eab308",
-  neutral: "#6b7280",
-  happy: "#22c55e",
+  angry: "#ef4444", disgusted: "#a855f7", fearful: "#f97316",
+  sad: "#3b82f6", surprised: "#eab308", neutral: "#6b7280", happy: "#22c55e",
 };
 
-// EAR threshold — eyes considered closed below this.
-// face-api.js landmarks at typical webcam resolution yield EAR ~0.25–0.35 open,
-// ~0.10–0.18 fully closed. 0.21 is too tight and misses real blinks. 0.25 is reliable.
-const EAR_THRESHOLD = 0.25;
-// At 150 ms inference a real blink (100–400 ms) spans only 1–2 frames.
-// Requiring 2 consecutive frames causes short blinks to be missed entirely.
-const BLINK_CONSEC_FRAMES = 1;
-// Minimum elapsed seconds before reporting a rate (avoids "60/min" after 1 blink in 1 s)
-const BLINK_RATE_MIN_ELAPSED_S = 10;
+const EAR_THRESHOLD = 0.22;  // 0.25 was too high — caught partial eye movements as blinks
+const MIN_BLINK_GAP_MS = 500;  // minimum ms between blinks to prevent overcounting
+const BLINK_CONSEC_FRAMES = 2;
+const CALIBRATION_DURATION_MS = 30000;
+const ALERT_COOLDOWN_MS = 30000;
+const BATCH_INTERVAL_MS = 5000;
+const TRAIN_SAMPLES_NEEDED = 25;
+const KNN_K = 3;
 
-// ─── EAR Calculation ───────────────────────────────────────────────────────────
-function euclidean(a: faceapi.Point, b: faceapi.Point) {
+// Phase 2 fallback thresholds
+const FALLBACK_STRESS_THRESHOLD = 0.7;
+const FALLBACK_BLINK_THRESHOLD = 8;
+
+// ─── Utility functions ─────────────────────────────────────────────────────────
+function euclidean(a: FaceAPI.Point, b: FaceAPI.Point) {
   return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2);
 }
 
-function eyeAspectRatio(pts: faceapi.Point[]): number {
-  // Soukupova & Cech 2016 formula
+function euclideanDesc(a: number[], b: number[]): number {
+  let sum = 0;
+  for (let i = 0; i < a.length; i++) sum += (a[i] - b[i]) ** 2;
+  return Math.sqrt(sum);
+}
+
+function eyeAspectRatio(pts: FaceAPI.Point[]): number {
+  // Vertical distances between upper and lower lid pairs
   const A = euclidean(pts[1], pts[5]);
   const B = euclidean(pts[2], pts[4]);
-  const C = euclidean(pts[0], pts[3]);
+  // Horizontal distance — use absolute value to handle both eye orientations
+  // (left eye: pts[0]=outer, pts[3]=inner; right eye order is mirrored in face-api)
+  const C = Math.abs(euclidean(pts[0], pts[3]));
+  if (C === 0) return 0;
   return (A + B) / (2.0 * C);
 }
 
-// ─── Stress calculation ────────────────────────────────────────────────────────
-function mapEmotionToStress(expressions: faceapi.FaceExpressions): number {
+function mapEmotionToStress(expressions: FaceAPI.FaceExpressions): number {
   let score = 0;
   const exprObj = expressions as unknown as Record<string, number>;
   for (const [emotion, weight] of Object.entries(STRESS_WEIGHTS)) {
@@ -123,12 +150,45 @@ function mapEmotionToStress(expressions: faceapi.FaceExpressions): number {
   return Math.min(1, score);
 }
 
-function dominantEmotion(expressions: faceapi.FaceExpressions): string {
+function dominantEmotion(expressions: FaceAPI.FaceExpressions): string {
   const exprObj = expressions as unknown as Record<string, number>;
   return Object.entries(exprObj).reduce((a, b) => (b[1] > a[1] ? b : a))[0];
 }
 
-// ─── Backend helpers ───────────────────────────────────────────────────────────
+// ─── KNN Classifier ────────────────────────────────────────────────────────────
+function knnPredict(
+  samples: KNNSample[],
+  query: number[],
+  k: number = KNN_K
+): TrainLabel | null {
+  if (samples.length < k) return null;
+  const distances = samples.map((s) => ({
+    label: s.label,
+    dist: euclideanDesc(s.descriptor, query),
+  }));
+  distances.sort((a, b) => a.dist - b.dist);
+  const nearest = distances.slice(0, k);
+  const votes: Record<string, number> = {};
+  for (const n of nearest) votes[n.label] = (votes[n.label] || 0) + 1;
+  return (Object.entries(votes).sort((a, b) => b[1] - a[1])[0][0]) as TrainLabel;
+}
+
+// ─── User identity helpers ─────────────────────────────────────────────────────
+function getOrCreateUserId(): string {
+  if (typeof window === "undefined") return "server";
+  let id = localStorage.getItem("facesense_userId");
+  if (!id) {
+    id = crypto.randomUUID();
+    localStorage.setItem("facesense_userId", id);
+  }
+  return id;
+}
+
+function generateSessionId(): string {
+  return crypto.randomUUID();
+}
+
+// ─── Backend URL ───────────────────────────────────────────────────────────────
 const BACKEND_URL =
   typeof process !== "undefined" && process.env.NEXT_PUBLIC_BACKEND_URL
     ? process.env.NEXT_PUBLIC_BACKEND_URL
@@ -148,20 +208,43 @@ export default function FaceSensePage() {
   const modelsLoadedRef = useRef(false);
   const isRunningRef = useRef(false);
 
+  // Identity / session
+  const userIdRef = useRef<string>("");
+  const sessionIdRef = useRef<string>("");
+
   // Blink tracking
   const blinkCountRef = useRef(0);
   const blinkConsecRef = useRef(0);
   const blinkStartTimeRef = useRef<number>(Date.now());
+  const lastBlinkTimeRef = useRef<number>(0); // for MIN_BLINK_GAP_MS enforcement
   const eyeClosedRef = useRef(false);
 
-  // Stress alert tracking
+  // Alert tracking with cooldown
   const stressHighSinceRef = useRef<number | null>(null);
   const alertFiredRef = useRef(false);
+  const lastAlertTimeRef = useRef<number>(0);
 
-  // Latest analytics refs (for draw loop and API loop — no stale closures)
+  // Latest analytics refs
   const latestEmotionRef = useRef("neutral");
   const latestStressRef = useRef(0);
   const latestBlinkRateRef = useRef(0);
+  const latestDescriptorRef = useRef<number[] | null>(null);
+
+  // Calibration
+  const calibrationSamplesRef = useRef<{ stress: number; blinkRate: number }[]>([]);
+  const calibrationStartRef = useRef<number>(0);
+  const isCalibrationDoneRef = useRef(false);
+
+  // Adaptive thresholds
+  const stressThresholdRef = useRef(FALLBACK_STRESS_THRESHOLD);
+  const blinkThresholdRef = useRef(FALLBACK_BLINK_THRESHOLD);
+
+  // API batch buffer
+  const batchBufferRef = useRef<object[]>([]);
+
+  // KNN training state
+  const knnSamplesRef = useRef<KNNSample[]>([]);
+  const trainingCountRef = useRef(0);
 
   const [status, setStatus] = useState<Status>("idle");
   const [errorMsg, setErrorMsg] = useState<string>("");
@@ -177,31 +260,71 @@ export default function FaceSensePage() {
   const [alertBlink, setAlertBlink] = useState(false);
   const [backendOk, setBackendOk] = useState<boolean | null>(null);
 
+  // Phase 3 UI state
+  const [calibProgress, setCalibProgress] = useState(0);
+  const [baseline, setBaseline] = useState<Baseline | null>(null);
+  const [knnPrediction, setKnnPrediction] = useState<TrainLabel | null>(null);
+  const [trainPhase, setTrainPhase] = useState<TrainPhase>("idle");
+  const [trainCount, setTrainCount] = useState(0);
+  const [modelReady, setModelReady] = useState(false);
+  const [showTrainingPanel, setShowTrainingPanel] = useState(false);
+  const [userId, setUserId] = useState<string>("");
+
   const fpsRef = useRef({ frames: 0, last: performance.now() });
 
-  // ── Load models (Phase 2 adds faceExpressionNet) ─────────────────────────────
+  // ── Initialise user identity ──────────────────────────────────────────────
+  useEffect(() => {
+    const id = getOrCreateUserId();
+    userIdRef.current = id;
+    setUserId(id);
+
+    // Try to load user's KNN model from backend
+    fetch(`${BACKEND_URL}/api/usermodel/${id}`)
+      .then((r) => r.json())
+      .then((data) => {
+        if (data.samples && data.samples.length >= KNN_K * 2) {
+          knnSamplesRef.current = data.samples;
+          setModelReady(true);
+        }
+      })
+      .catch(() => {/* offline — ok */});
+
+    // Try to load baseline
+    fetch(`${BACKEND_URL}/api/baseline/${id}`)
+      .then((r) => r.json())
+      .then((data) => {
+        if (data.baseline) {
+          setBaseline({ avgStress: data.baseline.avgStress, avgBlinkRate: data.baseline.avgBlinkRate });
+          stressThresholdRef.current = data.stressThreshold ?? FALLBACK_STRESS_THRESHOLD;
+          blinkThresholdRef.current = data.blinkThreshold ?? FALLBACK_BLINK_THRESHOLD;
+        }
+      })
+      .catch(() => {/* offline — use fallbacks */});
+  }, []);
+
+  // ── Load models ───────────────────────────────────────────────────────────
   const loadModels = useCallback(async () => {
     if (modelsLoadedRef.current) return;
     setStatus("loading-models");
     setErrorMsg("");
     try {
+      faceapi = await getFaceApi();
       await Promise.all([
         faceapi.nets.ssdMobilenetv1.loadFromUri("/models"),
         faceapi.nets.faceLandmark68Net.loadFromUri("/models"),
         faceapi.nets.faceExpressionNet.loadFromUri("/models"),
+        faceapi.nets.faceRecognitionNet.loadFromUri("/models"),
       ]);
       modelsLoadedRef.current = true;
       setStatus("models-ready");
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Unknown error";
-      setErrorMsg(
-        `Model load failed: ${msg}. Run: node scripts/download-models.js`
-      );
+      setErrorMsg(`Model load failed: ${msg}. Run: node scripts/download-models.js`);
       setStatus("error");
     }
   }, []);
 
-  // ── Start camera ─────────────────────────────────────────────────────────────
+  // ── Start camera ──────────────────────────────────────────────────────────
   const startCamera = useCallback(async () => {
     if (!modelsLoadedRef.current) {
       await loadModels();
@@ -226,16 +349,26 @@ export default function FaceSensePage() {
       canvas.width = video.videoWidth;
       canvas.height = video.videoHeight;
 
-      // Reset Phase 2 state
+      // New session ID
+      sessionIdRef.current = generateSessionId();
+
+      // Reset blink/stress/calibration state
       blinkCountRef.current = 0;
       blinkConsecRef.current = 0;
       blinkStartTimeRef.current = Date.now();
+      lastBlinkTimeRef.current = 0;
       eyeClosedRef.current = false;
       stressHighSinceRef.current = null;
       alertFiredRef.current = false;
+      lastAlertTimeRef.current = 0;
+      batchBufferRef.current = [];
+      calibrationSamplesRef.current = [];
+      calibrationStartRef.current = Date.now();
+      isCalibrationDoneRef.current = false;
+      setCalibProgress(0);
 
       isRunningRef.current = true;
-      setStatus("detecting");
+      setStatus("calibrating");
       startInferenceLoop();
       startDrawLoop();
       startApiLoop();
@@ -252,7 +385,7 @@ export default function FaceSensePage() {
     }
   }, [loadModels]);
 
-  // ── Stop camera ──────────────────────────────────────────────────────────────
+  // ── Stop camera ───────────────────────────────────────────────────────────
   const stopCamera = useCallback(() => {
     isRunningRef.current = false;
 
@@ -260,6 +393,11 @@ export default function FaceSensePage() {
     if (inferIntervalRef.current !== null) { clearInterval(inferIntervalRef.current); inferIntervalRef.current = null; }
     if (apiIntervalRef.current !== null) { clearInterval(apiIntervalRef.current); apiIntervalRef.current = null; }
     latestResultsRef.current = [];
+
+    // Flush remaining buffer
+    if (batchBufferRef.current.length > 0) {
+      flushBatch(batchBufferRef.current.splice(0));
+    }
 
     if (streamRef.current) { streamRef.current.getTracks().forEach((t) => t.stop()); streamRef.current = null; }
     if (videoRef.current) videoRef.current.srcObject = null;
@@ -273,10 +411,50 @@ export default function FaceSensePage() {
     setFaceCount(0); setFps(0);
     setEmotion("neutral"); setStressScore(0); setBlinkRate(0); setBlinkCount(0);
     setAlertStress(false); setAlertBlink(false);
+    setCalibProgress(0);
     setStatus("idle"); setErrorMsg("");
   }, []);
 
-  // ── Inference loop — 150 ms, Phase 2: withFaceExpressions ───────────────────
+  // ── Calibration finalization ───────────────────────────────────────────────
+  const finalizeCalibration = useCallback((samples: { stress: number; blinkRate: number }[]) => {
+    if (samples.length < 5) return;
+    const avgStress = samples.reduce((s, x) => s + x.stress, 0) / samples.length;
+    const avgBlinkRate = samples.reduce((s, x) => s + x.blinkRate, 0) / samples.length;
+
+    const newBaseline: Baseline = { avgStress, avgBlinkRate };
+    setBaseline(newBaseline);
+    stressThresholdRef.current = Math.min(0.95, avgStress + 0.2);
+    blinkThresholdRef.current = avgBlinkRate * 0.7;
+
+    // Save to backend (non-blocking)
+    fetch(`${BACKEND_URL}/api/baseline`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        userId: userIdRef.current,
+        avgStress,
+        avgBlinkRate,
+        sampleCount: samples.length,
+      }),
+    }).catch(() => {/* offline */});
+  }, []);
+
+  // ── API batch flush ────────────────────────────────────────────────────────
+  const flushBatch = useCallback(async (items: object[]) => {
+    if (items.length === 0) return;
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/session`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(items),
+      });
+      setBackendOk(res.ok);
+    } catch {
+      setBackendOk(false);
+    }
+  }, []);
+
+  // ── Inference loop ─────────────────────────────────────────────────────────
   const startInferenceLoop = useCallback(() => {
     const video = videoRef.current;
     if (!video) return;
@@ -288,19 +466,36 @@ export default function FaceSensePage() {
         const detections = await faceapi
           .detectAllFaces(video, new faceapi.SsdMobilenetv1Options({ minConfidence: 0.5 }))
           .withFaceLandmarks()
-          .withFaceExpressions();
+          .withFaceExpressions()
+          .withFaceDescriptors();
 
         const displaySize = { width: video.videoWidth, height: video.videoHeight };
         const resized = faceapi.resizeResults(detections, displaySize) as FaceResult[];
         latestResultsRef.current = resized;
 
         setFaceCount(resized.length);
-        setStatus(resized.length === 0 ? "no-face" : "detecting");
+
+        // Calibration phase
+        const now = Date.now();
+        const elapsed = now - calibrationStartRef.current;
+
+        if (!isCalibrationDoneRef.current) {
+          const pct = Math.min(100, Math.round((elapsed / CALIBRATION_DURATION_MS) * 100));
+          setCalibProgress(pct);
+
+          if (elapsed >= CALIBRATION_DURATION_MS) {
+            isCalibrationDoneRef.current = true;
+            finalizeCalibration(calibrationSamplesRef.current);
+            setStatus(resized.length === 0 ? "no-face" : "detecting");
+          }
+        } else {
+          setStatus(resized.length === 0 ? "no-face" : "detecting");
+        }
 
         if (resized.length > 0) {
           const first = resized[0];
 
-          // ── Emotion & Stress ─────────────────────────────────────────────
+          // ── Emotion & Stress ────────────────────────────────────────────
           const dom = dominantEmotion(first.expressions);
           const stress = mapEmotionToStress(first.expressions);
           latestEmotionRef.current = dom;
@@ -308,38 +503,78 @@ export default function FaceSensePage() {
           setEmotion(dom);
           setStressScore(Math.round(stress * 100) / 100);
 
-          // ── Blink (EAR) ──────────────────────────────────────────────────
+          // ── Descriptor (for KNN) ────────────────────────────────────────
+          if (first.descriptor) {
+            const desc = Array.from(first.descriptor);
+            latestDescriptorRef.current = desc;
+
+            // KNN prediction if model ready
+            if (knnSamplesRef.current.length >= KNN_K * 2) {
+              const pred = knnPredict(knnSamplesRef.current, desc);
+              setKnnPrediction(pred);
+            }
+
+            // Capture training sample if in training mode
+            if (trainPhaseRef.current !== "idle" && trainPhaseRef.current !== "done") {
+              const label = trainPhaseRef.current as TrainLabel;
+              if (trainingCountRef.current < TRAIN_SAMPLES_NEEDED) {
+                trainingCountRef.current++;
+                knnSamplesRef.current.push({ descriptor: desc, label });
+                setTrainCount(trainingCountRef.current);
+                if (trainingCountRef.current >= TRAIN_SAMPLES_NEEDED) {
+                  trainPhaseRef.current = "done";
+                  setTrainPhase("done");
+                }
+              }
+            }
+          }
+
+          // ── Blink (EAR) ─────────────────────────────────────────────────
           const pts = first.landmarks.positions;
           const leftEye = pts.slice(36, 42);
           const rightEye = pts.slice(42, 48);
           const ear = (eyeAspectRatio(leftEye) + eyeAspectRatio(rightEye)) / 2;
 
           if (ear < EAR_THRESHOLD) {
+            eyeClosedRef.current = true;
             blinkConsecRef.current++;
           } else {
             if (blinkConsecRef.current >= BLINK_CONSEC_FRAMES) {
-              blinkCountRef.current++;
-              setBlinkCount(blinkCountRef.current);
+              // Only count as a blink if enough time has passed since the last one.
+              // Without this, a single slow blink (EAR stays low across many frames)
+              // can fire multiple counts as blinkConsecRef resets and rises again.
+              const nowBlink = Date.now();
+              if (nowBlink - lastBlinkTimeRef.current >= MIN_BLINK_GAP_MS) {
+                lastBlinkTimeRef.current = nowBlink;
+                blinkCountRef.current++;
+                setBlinkCount(blinkCountRef.current);
+              }
             }
             blinkConsecRef.current = 0;
+            eyeClosedRef.current = false;
           }
-          eyeClosedRef.current = ear < EAR_THRESHOLD;
 
-          // Rate: use elapsed time but clamp to a rolling 60-s window to avoid
-          // wild numbers at session start, and require at least 10 s of data.
-          const elapsedSec = (Date.now() - blinkStartTimeRef.current) / 1000;
-          const windowSec = Math.min(elapsedSec, 60); // cap at 60 s window
-          const rate = elapsedSec >= BLINK_RATE_MIN_ELAPSED_S
-            ? Math.round((blinkCountRef.current / windowSec) * 60)
-            : 0; // show 0 until we have enough data
+          const elapsedMin = (Date.now() - blinkStartTimeRef.current) / 60000;
+          const rate = elapsedMin > 0 ? Math.round(blinkCountRef.current / elapsedMin) : 0;
           latestBlinkRateRef.current = rate;
           setBlinkRate(rate);
 
-          // ── Alerts ───────────────────────────────────────────────────────
-          if (stress > 0.7) {
-            if (stressHighSinceRef.current === null) stressHighSinceRef.current = Date.now();
-            if (Date.now() - stressHighSinceRef.current > 10000 && !alertFiredRef.current) {
+          // ── Calibration sample collection ───────────────────────────────
+          if (!isCalibrationDoneRef.current) {
+            calibrationSamplesRef.current.push({ stress, blinkRate: rate });
+          }
+
+          // ── Adaptive alerts with cooldown ───────────────────────────────
+          const stressThresh = stressThresholdRef.current;
+          const blinkThresh = blinkThresholdRef.current;
+          const nowMs = Date.now();
+          const cooldownOk = (nowMs - lastAlertTimeRef.current) >= ALERT_COOLDOWN_MS;
+
+          if (stress > stressThresh) {
+            if (stressHighSinceRef.current === null) stressHighSinceRef.current = nowMs;
+            if (nowMs - stressHighSinceRef.current > 10000 && !alertFiredRef.current && cooldownOk) {
               alertFiredRef.current = true;
+              lastAlertTimeRef.current = nowMs;
               setAlertStress(true);
               playBeep(880, 0.3);
             }
@@ -349,49 +584,101 @@ export default function FaceSensePage() {
             setAlertStress(false);
           }
 
+          // Bug 3 fix: previous logic had a missing else branch — when elapsed30s was
+          // false AND rate < blinkThresh, neither branch ran, leaving alertBlink stuck.
+          // Also removed the `rate > 0` guard: 0 blinks after 30s still warrants an alert.
           const elapsed30s = (Date.now() - blinkStartTimeRef.current) > 30000;
-          if (elapsed30s && rate < 8 && rate > 0) {
+          if (elapsed30s && rate < blinkThresh) {
             setAlertBlink(true);
-          } else if (rate >= 8) {
+          } else {
             setAlertBlink(false);
           }
+
         } else {
           latestEmotionRef.current = "neutral";
           latestStressRef.current = 0;
+          latestDescriptorRef.current = null;
           setEmotion("neutral"); setStressScore(0);
           stressHighSinceRef.current = null;
           alertFiredRef.current = false;
           setAlertStress(false);
+          setKnnPrediction(null);
         }
       } catch {
         // Skip failed frames silently
       }
     }, 150);
-  }, []);
+  }, [finalizeCalibration]);
 
-  // ── API loop — POST to backend every 3 s ────────────────────────────────────
+  // ── API batch loop — flush every 5s ───────────────────────────────────────
   const startApiLoop = useCallback(() => {
-    apiIntervalRef.current = setInterval(async () => {
-      if (!isRunningRef.current || latestResultsRef.current.length === 0) return;
-      try {
-        const res = await fetch(`${BACKEND_URL}/api/session`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            emotion: latestEmotionRef.current,
-            stressScore: latestStressRef.current,
-            blinkRate: latestBlinkRateRef.current,
-            timestamp: new Date().toISOString(),
-          }),
+    apiIntervalRef.current = setInterval(() => {
+      if (!isRunningRef.current) return;
+
+      // Add current snapshot to buffer (even if no face — rate = 0)
+      if (userIdRef.current && sessionIdRef.current) {
+        batchBufferRef.current.push({
+          userId: userIdRef.current,
+          sessionId: sessionIdRef.current,
+          emotion: latestEmotionRef.current,
+          stressScore: latestStressRef.current,
+          blinkRate: latestBlinkRateRef.current,
+          timestamp: new Date().toISOString(),
         });
-        setBackendOk(res.ok);
-      } catch {
-        setBackendOk(false);
       }
-    }, 3000);
+
+      // Flush buffer
+      if (batchBufferRef.current.length > 0) {
+        flushBatch(batchBufferRef.current.splice(0));
+      }
+    }, BATCH_INTERVAL_MS);
+  }, [flushBatch]);
+
+  // ── Training phase ref (needs to be readable inside interval) ─────────────
+  const trainPhaseRef = useRef<TrainPhase>("idle");
+
+  // ── Start training for a label ─────────────────────────────────────────────
+  const startTraining = useCallback((label: TrainLabel) => {
+    trainingCountRef.current = 0;
+    trainPhaseRef.current = label;
+    setTrainPhase(label);
+    setTrainCount(0);
   }, []);
 
-  // ── Draw loop — unchanged from Phase 1 + emotion label colour ───────────────
+  // ── Save trained model to backend ─────────────────────────────────────────
+  const saveModel = useCallback(async () => {
+    if (knnSamplesRef.current.length < KNN_K * 2) return;
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/usermodel`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          userId: userIdRef.current,
+          samples: knnSamplesRef.current,
+        }),
+      });
+      if (res.ok) {
+        setModelReady(true);
+        setTrainPhase("idle");
+        trainPhaseRef.current = "idle";
+      }
+    } catch {
+      // offline — model stays in-memory only
+      setModelReady(knnSamplesRef.current.length >= KNN_K * 2);
+    }
+  }, []);
+
+  // ── Clear model ────────────────────────────────────────────────────────────
+  const clearModel = useCallback(() => {
+    knnSamplesRef.current = [];
+    setModelReady(false);
+    setKnnPrediction(null);
+    setTrainPhase("idle");
+    trainPhaseRef.current = "idle";
+    fetch(`${BACKEND_URL}/api/usermodel/${userIdRef.current}`, { method: "DELETE" }).catch(() => {});
+  }, []);
+
+  // ── Draw loop ──────────────────────────────────────────────────────────────
   const startDrawLoop = useCallback(() => {
     const video = videoRef.current;
     const canvas = canvasRef.current;
@@ -405,38 +692,55 @@ export default function FaceSensePage() {
 
       const results = latestResultsRef.current;
       results.forEach(({ detection, landmarks }) => {
-        const box = detection.box;
+        const rawBox = detection.box;
         const score = detection.score;
 
-        // Bounding box
-        ctx.strokeStyle = "#00f5d4";
-        ctx.lineWidth = 2;
-        ctx.shadowColor = "#00f5d4";
-        ctx.shadowBlur = 12;
-        ctx.strokeRect(box.x, box.y, box.width, box.height);
-        ctx.shadowBlur = 0;
+        // Expand the face-api bounding box to cover the full head including hair.
+        // face-api boxes only wrap the detected landmarks (chin to forehead hairline)
+        // so we pad: 30% extra height upward (for hair/forehead), 10% on sides.
+        const padX = rawBox.width * 0.10;
+        const padYTop = rawBox.height * 0.30;
+        const padYBot = rawBox.height * 0.05;
+        const box = {
+          x: Math.max(0, rawBox.x - padX),
+          y: Math.max(0, rawBox.y - padYTop),
+          width: rawBox.width + padX * 2,
+          height: rawBox.height + padYTop + padYBot,
+        };
 
-        // Corner accents
-        drawCorners(ctx, box.x, box.y, box.width, box.height, 16, "#00f5d4");
+        // The canvas element has CSS scaleX(-1) applied, which mirrors the entire
+        // canvas visually. All drawing uses the raw (un-mirrored) landmark/box
+        // coordinates from face-api — the CSS transform handles the visual flip.
+        // For text we must counter-flip (scale -1 / translate) so it reads correctly.
 
-        // Confidence + emotion label (un-mirror for correct text rendering)
         const emColor = EMOTION_COLORS[latestEmotionRef.current] ?? "#00f5d4";
         const label = `FACE ${(score * 100).toFixed(1)}%  ${latestEmotionRef.current.toUpperCase()}`;
         ctx.font = "bold 13px monospace";
         const tw = ctx.measureText(label).width;
 
+        // Draw the padded bounding box
+        ctx.save();
+        ctx.strokeStyle = emColor + "cc";
+        ctx.lineWidth = 2;
+        ctx.shadowColor = emColor;
+        ctx.shadowBlur = 8;
+        ctx.strokeRect(box.x, box.y, box.width, box.height);
+        ctx.shadowBlur = 0;
+        ctx.restore();
+
+        // Label: counter-flip text so it reads correctly under CSS scaleX(-1).
+        // Visual left edge of box after CSS flip = canvas.width - box.x - box.width
         ctx.save();
         ctx.scale(-1, 1);
         ctx.translate(-canvas.width, 0);
-        const ux = canvas.width - box.x - tw - 12;
-
+        const labelX = canvas.width - box.x - box.width;
         ctx.fillStyle = "rgba(0,0,0,0.75)";
-        ctx.fillRect(ux, box.y - 24, tw + 12, 22);
+        ctx.fillRect(labelX, box.y - 24, tw + 12, 22);
         ctx.fillStyle = emColor;
-        ctx.fillText(label, ux + 6, box.y - 7);
+        ctx.fillText(label, labelX + 6, box.y - 7);
         ctx.restore();
 
-        // Landmark groups (unchanged)
+        // Use original landmark coordinates — CSS scaleX(-1) on canvas handles the mirror
         const pts = landmarks.positions;
         drawLandmarkGroup(ctx, pts.slice(0, 17),  "#4cc9f0", false);
         drawLandmarkGroup(ctx, pts.slice(17, 22), "#f72585", false);
@@ -448,20 +752,19 @@ export default function FaceSensePage() {
         drawLandmarkGroup(ctx, pts.slice(48, 60), "#f72585", true);
         drawLandmarkGroup(ctx, pts.slice(60, 68), "#f72585", true);
 
-        // Blink indicator
         if (eyeClosedRef.current) {
           ctx.save();
           ctx.scale(-1, 1);
           ctx.translate(-canvas.width, 0);
           ctx.font = "bold 11px monospace";
           ctx.fillStyle = "#facc15";
-          const bx = canvas.width - box.x - box.width + 4;
-          ctx.fillText("● BLINK", bx, box.y + box.height + 16);
+          // Use same mirror formula as the label: canvas.width - box.x - box.width
+          const blinkLabelX = canvas.width - box.x - box.width + 4;
+          ctx.fillText("● BLINK", blinkLabelX, box.y + box.height + 16);
           ctx.restore();
         }
       });
 
-      // FPS counter
       const now = performance.now();
       fpsRef.current.frames++;
       if (now - fpsRef.current.last >= 1000) {
@@ -478,16 +781,19 @@ export default function FaceSensePage() {
 
   useEffect(() => { return () => { stopCamera(); }; }, [stopCamera]);
 
-  const isRunning = status === "detecting" || status === "no-face";
+  const isRunning = status === "detecting" || status === "no-face" || status === "calibrating";
   const isLoading = status === "loading-models" || status === "requesting-camera";
+  const isCalibrating = status === "calibrating";
 
   const stressPct = Math.round(stressScore * 100);
   const stressColor =
-    stressPct >= 70 ? "#ef4444" : stressPct >= 40 ? "#f97316" : "#22c55e";
+    stressPct >= Math.round(stressThresholdRef.current * 100)
+      ? "#ef4444"
+      : stressPct >= 40 ? "#f97316" : "#22c55e";
 
-  // ── Render ────────────────────────────────────────────────────────────────────
+  // ── Render ─────────────────────────────────────────────────────────────────
   return (
-    <main className="min-h-screen bg-[#0a0a0f] text-white flex flex-col items-center justify-start py-10 px-4" suppressHydrationWarning>
+    <main className="min-h-screen bg-[#0a0a0f] text-white flex flex-col items-center justify-start py-10 px-4">
 
       {/* Header */}
       <header className="mb-8 text-center select-none">
@@ -499,9 +805,33 @@ export default function FaceSensePage() {
           <div className="w-2 h-2 rounded-full bg-[#00f5d4] animate-pulse shadow-[0_0_8px_#00f5d4]" />
         </div>
         <p className="text-xs text-zinc-600 tracking-widest uppercase font-mono">
-          Phase 2 — Emotion · Stress · Blink Detection
+          Phase 3 — Personalized AI · Adaptive Thresholds · KNN
         </p>
+        {userId && (
+          <p className="text-[10px] text-zinc-700 font-mono mt-1">
+            User: {userId.slice(0, 8)}…
+          </p>
+        )}
       </header>
+
+      {/* Calibration bar */}
+      {isCalibrating && (
+        <div className="mb-4 w-full max-w-5xl">
+          <div className="flex items-center justify-between mb-1">
+            <span className="text-xs font-mono text-purple-400">Calibrating baseline…</span>
+            <span className="text-xs font-mono text-purple-300">{calibProgress}%</span>
+          </div>
+          <div className="w-full h-1.5 bg-zinc-800 rounded-full overflow-hidden">
+            <div
+              className="h-full rounded-full transition-all duration-300"
+              style={{ width: `${calibProgress}%`, backgroundColor: "#a855f7" }}
+            />
+          </div>
+          <p className="text-[10px] font-mono text-zinc-600 mt-1">
+            Sit relaxed — we are learning your baseline stress and blink patterns
+          </p>
+        </div>
+      )}
 
       {/* Alerts */}
       {(alertStress || alertBlink) && (
@@ -530,7 +860,9 @@ export default function FaceSensePage() {
             isRunning
               ? alertStress
                 ? "border-red-500/50 shadow-[0_0_40px_rgba(239,68,68,0.2)]"
-                : "border-[#00f5d4]/30 shadow-[0_0_40px_rgba(0,245,212,0.1)]"
+                : isCalibrating
+                  ? "border-purple-500/40 shadow-[0_0_40px_rgba(168,85,247,0.15)]"
+                  : "border-[#00f5d4]/30 shadow-[0_0_40px_rgba(0,245,212,0.1)]"
               : "border-zinc-800"
           }`}>
             <video
@@ -568,6 +900,13 @@ export default function FaceSensePage() {
             <div className="absolute top-3 right-3 flex flex-col gap-1.5 items-end pointer-events-none">
               <HudBadge color="#00f5d4" label="FACES" value={String(faceCount)} />
               <HudBadge color="#7209b7" label="FPS"   value={String(fps)} />
+              {modelReady && knnPrediction && (
+                <HudBadge
+                  color={knnPrediction === "stressed" ? "#ef4444" : "#22c55e"}
+                  label="KNN"
+                  value={knnPrediction.toUpperCase()}
+                />
+              )}
             </div>
           )}
 
@@ -579,7 +918,7 @@ export default function FaceSensePage() {
           )}
         </div>
 
-        {/* ── Analytics Panel ─────────────────────────────────────────────── */}
+        {/* ── Analytics Panel ──────────────────────────────────────────────── */}
         {isRunning && (
           <div className="xl:w-64 flex flex-col gap-3">
 
@@ -606,9 +945,16 @@ export default function FaceSensePage() {
               <div className="w-full h-2.5 bg-zinc-800 rounded-full overflow-hidden">
                 <div className="h-full rounded-full transition-all duration-500" style={{ width: `${stressPct}%`, backgroundColor: stressColor }} />
               </div>
-              <p className="text-[10px] font-mono text-zinc-600 mt-1.5">
-                {stressPct >= 70 ? "HIGH — take a break" : stressPct >= 40 ? "MODERATE" : "LOW — calm"}
-              </p>
+              <div className="flex justify-between mt-1">
+                <p className="text-[10px] font-mono text-zinc-600">
+                  {stressPct >= Math.round(stressThresholdRef.current * 100) ? "HIGH — take a break" : stressPct >= 40 ? "MODERATE" : "LOW — calm"}
+                </p>
+                {baseline && (
+                  <p className="text-[10px] font-mono text-purple-500">
+                    thresh: {Math.round(stressThresholdRef.current * 100)}%
+                  </p>
+                )}
+              </div>
             </div>
 
             {/* Blink card */}
@@ -624,8 +970,27 @@ export default function FaceSensePage() {
                   <p className="text-[10px] font-mono text-zinc-600">total</p>
                 </div>
               </div>
-              {alertBlink && <p className="text-[10px] font-mono text-amber-400 mt-2">⚠ Rate too low (&lt;8/min)</p>}
+              {baseline && (
+                <p className="text-[10px] font-mono text-purple-500 mt-1">
+                  threshold: {Math.round(blinkThresholdRef.current)}/min
+                </p>
+              )}
+              {alertBlink && <p className="text-[10px] font-mono text-amber-400 mt-1">⚠ Rate too low</p>}
             </div>
+
+            {/* KNN prediction card */}
+            {modelReady && (
+              <div className="bg-zinc-900/70 border border-zinc-800 rounded-xl p-3">
+                <p className="text-[10px] font-mono text-zinc-500 uppercase tracking-widest mb-1">KNN Prediction</p>
+                {knnPrediction ? (
+                  <p className="text-sm font-bold font-mono" style={{ color: knnPrediction === "stressed" ? "#ef4444" : "#22c55e" }}>
+                    {knnPrediction === "stressed" ? "😰 STRESSED" : "😌 RELAXED"}
+                  </p>
+                ) : (
+                  <p className="text-xs font-mono text-zinc-600">waiting for face…</p>
+                )}
+              </div>
+            )}
 
             {/* Backend status */}
             <div className="bg-zinc-900/70 border border-zinc-800 rounded-xl p-3 flex items-center gap-2">
@@ -643,6 +1008,104 @@ export default function FaceSensePage() {
           </div>
         )}
       </div>
+
+      {/* Training panel toggle */}
+      {isRunning && !isCalibrating && (
+        <div className="mt-4 w-full max-w-5xl">
+          <button
+            onClick={() => setShowTrainingPanel(!showTrainingPanel)}
+            className="text-xs font-mono text-purple-400 border border-purple-500/30 rounded px-3 py-1.5 hover:bg-purple-500/10 transition-colors"
+          >
+            {showTrainingPanel ? "▲ Hide" : "▼ Show"} Training Panel
+          </button>
+
+          {showTrainingPanel && (
+            <div className="mt-3 bg-zinc-900/70 border border-zinc-800 rounded-xl p-4">
+              <p className="text-xs font-mono text-zinc-400 font-bold mb-3 uppercase tracking-widest">
+                KNN Training Mode
+              </p>
+
+              {trainPhase === "idle" && (
+                <div className="flex flex-col gap-3">
+                  <p className="text-xs font-mono text-zinc-500">
+                    Train a personalized model. Make a relaxed face, then a stressed face.
+                    The system captures {TRAIN_SAMPLES_NEEDED} samples per label.
+                  </p>
+                  <div className="flex gap-3">
+                    <button
+                      onClick={() => startTraining("relaxed")}
+                      className="px-4 py-2 text-xs font-mono font-bold rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 hover:bg-emerald-500/20 transition-colors"
+                    >
+                      😌 Start Relaxed
+                    </button>
+                    <button
+                      onClick={() => startTraining("stressed")}
+                      className="px-4 py-2 text-xs font-mono font-bold rounded-lg bg-red-500/10 border border-red-500/30 text-red-400 hover:bg-red-500/20 transition-colors"
+                    >
+                      😰 Start Stressed
+                    </button>
+                    {modelReady && (
+                      <button
+                        onClick={clearModel}
+                        className="px-4 py-2 text-xs font-mono font-bold rounded-lg bg-zinc-800 border border-zinc-700 text-zinc-400 hover:bg-zinc-700 transition-colors"
+                      >
+                        🗑 Clear Model
+                      </button>
+                    )}
+                  </div>
+                  {modelReady && (
+                    <p className="text-xs font-mono text-emerald-400">
+                      ✓ Model ready with {knnSamplesRef.current.length} samples
+                    </p>
+                  )}
+                </div>
+              )}
+
+              {(trainPhase === "relaxed" || trainPhase === "stressed") && (
+                <div>
+                  <p className="text-xs font-mono text-zinc-400 mb-2">
+                    Capturing <span className="font-bold" style={{ color: trainPhase === "relaxed" ? "#22c55e" : "#ef4444" }}>
+                      {trainPhase.toUpperCase()}
+                    </span> samples — hold expression naturally
+                  </p>
+                  <div className="w-full h-2 bg-zinc-800 rounded-full overflow-hidden mb-2">
+                    <div
+                      className="h-full rounded-full transition-all"
+                      style={{
+                        width: `${Math.round((trainCount / TRAIN_SAMPLES_NEEDED) * 100)}%`,
+                        backgroundColor: trainPhase === "relaxed" ? "#22c55e" : "#ef4444",
+                      }}
+                    />
+                  </div>
+                  <p className="text-xs font-mono text-zinc-500">{trainCount} / {TRAIN_SAMPLES_NEEDED}</p>
+                </div>
+              )}
+
+              {trainPhase === "done" && (
+                <div className="flex flex-col gap-3">
+                  <p className="text-xs font-mono text-emerald-400">
+                    ✓ Capture complete! Total samples: {knnSamplesRef.current.length}
+                  </p>
+                  <div className="flex gap-3">
+                    <button
+                      onClick={() => { setTrainPhase("idle"); trainPhaseRef.current = "idle"; }}
+                      className="px-4 py-2 text-xs font-mono font-bold rounded-lg bg-zinc-800 border border-zinc-700 text-zinc-300 hover:bg-zinc-700 transition-colors"
+                    >
+                      + More Training
+                    </button>
+                    <button
+                      onClick={saveModel}
+                      className="px-4 py-2 text-xs font-mono font-bold rounded-lg bg-[#00f5d4]/10 border border-[#00f5d4]/30 text-[#00f5d4] hover:bg-[#00f5d4]/20 transition-colors"
+                    >
+                      💾 Save Model
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Status bar */}
       <div className="mt-4 flex items-center gap-2 font-mono text-xs tracking-widest uppercase">
@@ -684,7 +1147,7 @@ export default function FaceSensePage() {
           { label: "Detection Model", value: "SSD MobileNet v1" },
           { label: "Emotion Model",   value: "Expression Net" },
           { label: "Landmark Points", value: "68 Points" },
-          { label: "Processing",      value: "Client-side" },
+          { label: "AI Model",        value: modelReady ? "KNN Ready ✓" : "KNN (untrained)" },
         ].map(({ label, value }) => (
           <div key={label} className="bg-zinc-900/60 border border-zinc-800 rounded-lg py-3 px-2">
             <p className="text-[10px] font-mono text-zinc-600 uppercase tracking-widest mb-1">{label}</p>
@@ -696,15 +1159,15 @@ export default function FaceSensePage() {
       {/* Legend */}
       {isRunning && (
         <div className="mt-6 flex flex-wrap gap-5 justify-center text-xs font-mono text-zinc-500">
-          <LegendDot color="#00f5d4" label="Face Box"    />
-          <LegendDot color="#4cc9f0" label="Jaw / Nose"  />
-          <LegendDot color="#7209b7" label="Eyes"        />
+          <LegendDot color="#00f5d4" label="Face Box" />
+          <LegendDot color="#4cc9f0" label="Jaw / Nose" />
+          <LegendDot color="#7209b7" label="Eyes" />
           <LegendDot color="#f72585" label="Brows / Mouth" />
         </div>
       )}
 
       <footer className="mt-12 text-zinc-800 text-xs font-mono text-center">
-        FaceSense Phase 2 · face-api.js · Emotion · Stress · Blink · Express + MongoDB
+        FaceSense Phase 3 · face-api.js · KNN · Adaptive Thresholds · Express + MongoDB
       </footer>
     </main>
   );
@@ -724,11 +1187,11 @@ function playBeep(freq = 880, duration = 0.2) {
     osc.start(ctx.currentTime);
     osc.stop(ctx.currentTime + duration);
   } catch {
-    // AudioContext not available — skip
+    // AudioContext not available
   }
 }
 
-// ─── Canvas helpers (unchanged from Phase 1) ──────────────────────────────────
+// ─── Canvas helpers ────────────────────────────────────────────────────────────
 function drawCorners(
   ctx: CanvasRenderingContext2D,
   x: number, y: number, w: number, h: number,
@@ -740,10 +1203,10 @@ function drawCorners(
   ctx.shadowBlur = 10;
 
   const corners: Array<[[number,number],[number,number],[number,number]]> = [
-    [[x,       y+size], [x,   y  ], [x+size, y  ]],
-    [[x+w-size,y      ], [x+w, y  ], [x+w,   y+size]],
-    [[x+w,     y+h-size],[x+w, y+h], [x+w-size,y+h]],
-    [[x+size,  y+h    ], [x,   y+h], [x,     y+h-size]],
+    [[x, y+size], [x, y], [x+size, y]],
+    [[x+w-size, y], [x+w, y], [x+w, y+size]],
+    [[x+w, y+h-size], [x+w, y+h], [x+w-size, y+h]],
+    [[x+size, y+h], [x, y+h], [x, y+h-size]],
   ];
 
   corners.forEach(([[ax,ay],[bx,by],[cx,cy]]) => {
@@ -758,7 +1221,7 @@ function drawCorners(
 
 function drawLandmarkGroup(
   ctx: CanvasRenderingContext2D,
-  points: faceapi.Point[],
+  points: FaceAPI.Point[],
   color: string,
   close: boolean
 ) {
@@ -783,7 +1246,7 @@ function drawLandmarkGroup(
   });
 }
 
-// ─── UI sub-components (unchanged from Phase 1) ───────────────────────────────
+// ─── UI sub-components ─────────────────────────────────────────────────────────
 function CameraOffIcon() {
   return (
     <svg width="52" height="52" viewBox="0 0 52 52" fill="none" className="text-zinc-800">
