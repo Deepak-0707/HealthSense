@@ -1,0 +1,21 @@
+services:
+  # ── FaceSense Phase 4 — Express Backend ──────────────────────────────────────
+  - type: web
+    name: facesense-backend
+    env: node
+    region: oregon            # free-tier region
+    plan: free
+    rootDir: server
+    buildCommand: npm install
+    startCommand: node index.js
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 5000
+      # Set these in the Render dashboard (never commit secrets):
+      - key: MONGO_URI
+        sync: false           # prompts you to set manually in Render UI
+      - key: FRONTEND_URL
+        sync: false           # your Vercel URL e.g. https://facesense.vercel.app

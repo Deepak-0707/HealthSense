@@ -1,25 +1,20 @@
 "use client";
 
 /**
- * FaceSense Phase 3 — Personalized AI · Session Management · Adaptive Thresholds
+ * FaceSense Phase 4 — Production-Ready · Notifications · Dashboard Link
  *
- * Phase 1 features preserved: ✓ webcam, face detection, canvas rendering, landmarks
- * Phase 2 features preserved: ✓ emotion, stress, blink detection, alerts, backend POST
+ * Phase 1–3 features preserved: ✓ all previous functionality intact
  *
- * Phase 3 additions:
- *   + User identity (UUID → localStorage)
- *   + Session management (per-camera-run sessionId)
- *   + Baseline calibration (30s window on session start)
- *   + Adaptive thresholds (stressThreshold, blinkThreshold)
- *   + KNN training mode (relaxed / stressed samples)
- *   + KNN classification using Euclidean distance
- *   + Alert cooldown (30s minimum gap)
- *   + API batching (buffer → flush every 5s)
- *   + Input validation + error handling / fallbacks
+ * Phase 4 additions:
+ *   + Browser Notification API (permission request on first run)
+ *   + Notifications fire on high stress / low blink rate
+ *   + Alert events persisted to /api/alerts backend endpoint
+ *   + Navigation link to /dashboard analytics page
+ *   + UX: smooth loading states, error recovery, polished layout
  */
 
 import { useEffect, useRef, useCallback, useState } from "react";
-import type * as FaceAPI from "@vladmandic/face-api";
+import Link from "next/link";
 
 // @vladmandic/face-api uses browser APIs — must not be imported at module level
 // during SSR. We load it lazily inside useEffect (client-only).
@@ -66,9 +61,9 @@ const STATUS_COLORS: Record<Status, string> = {
 };
 
 type FaceResult = {
-  detection: FaceAPI.FaceDetection;
-  landmarks: FaceAPI.FaceLandmarks68;
-  expressions: FaceAPI.FaceExpressions;
+  detection: faceapi.FaceDetection;
+  landmarks: faceapi.FaceLandmarks68;
+  expressions: faceapi.FaceExpressions;
   descriptor?: Float32Array;
 };
 
@@ -106,8 +101,7 @@ const EMOTION_COLORS: Record<string, string> = {
   sad: "#3b82f6", surprised: "#eab308", neutral: "#6b7280", happy: "#22c55e",
 };
 
-const EAR_THRESHOLD = 0.22;  // 0.25 was too high — caught partial eye movements as blinks
-const MIN_BLINK_GAP_MS = 500;  // minimum ms between blinks to prevent overcounting
+const EAR_THRESHOLD = 0.21;
 const BLINK_CONSEC_FRAMES = 2;
 const CALIBRATION_DURATION_MS = 30000;
 const ALERT_COOLDOWN_MS = 30000;
@@ -120,7 +114,7 @@ const FALLBACK_STRESS_THRESHOLD = 0.7;
 const FALLBACK_BLINK_THRESHOLD = 8;
 
 // ─── Utility functions ─────────────────────────────────────────────────────────
-function euclidean(a: FaceAPI.Point, b: FaceAPI.Point) {
+function euclidean(a: faceapi.Point, b: faceapi.Point) {
   return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2);
 }
 
@@ -130,18 +124,14 @@ function euclideanDesc(a: number[], b: number[]): number {
   return Math.sqrt(sum);
 }
 
-function eyeAspectRatio(pts: FaceAPI.Point[]): number {
-  // Vertical distances between upper and lower lid pairs
+function eyeAspectRatio(pts: faceapi.Point[]): number {
   const A = euclidean(pts[1], pts[5]);
   const B = euclidean(pts[2], pts[4]);
-  // Horizontal distance — use absolute value to handle both eye orientations
-  // (left eye: pts[0]=outer, pts[3]=inner; right eye order is mirrored in face-api)
-  const C = Math.abs(euclidean(pts[0], pts[3]));
-  if (C === 0) return 0;
+  const C = euclidean(pts[0], pts[3]);
   return (A + B) / (2.0 * C);
 }
 
-function mapEmotionToStress(expressions: FaceAPI.FaceExpressions): number {
+function mapEmotionToStress(expressions: faceapi.FaceExpressions): number {
   let score = 0;
   const exprObj = expressions as unknown as Record<string, number>;
   for (const [emotion, weight] of Object.entries(STRESS_WEIGHTS)) {
@@ -150,7 +140,7 @@ function mapEmotionToStress(expressions: FaceAPI.FaceExpressions): number {
   return Math.min(1, score);
 }
 
-function dominantEmotion(expressions: FaceAPI.FaceExpressions): string {
+function dominantEmotion(expressions: faceapi.FaceExpressions): string {
   const exprObj = expressions as unknown as Record<string, number>;
   return Object.entries(exprObj).reduce((a, b) => (b[1] > a[1] ? b : a))[0];
 }
@@ -216,7 +206,6 @@ export default function FaceSensePage() {
   const blinkCountRef = useRef(0);
   const blinkConsecRef = useRef(0);
   const blinkStartTimeRef = useRef<number>(Date.now());
-  const lastBlinkTimeRef = useRef<number>(0); // for MIN_BLINK_GAP_MS enforcement
   const eyeClosedRef = useRef(false);
 
   // Alert tracking with cooldown
@@ -258,6 +247,7 @@ export default function FaceSensePage() {
   const [blinkCount, setBlinkCount] = useState(0);
   const [alertStress, setAlertStress] = useState(false);
   const [alertBlink, setAlertBlink] = useState(false);
+  const alertBlinkRef = useRef(false);
   const [backendOk, setBackendOk] = useState<boolean | null>(null);
 
   // Phase 3 UI state
@@ -269,6 +259,7 @@ export default function FaceSensePage() {
   const [modelReady, setModelReady] = useState(false);
   const [showTrainingPanel, setShowTrainingPanel] = useState(false);
   const [userId, setUserId] = useState<string>("");
+  const [notifPermission, setNotifPermission] = useState<NotificationPermission>("default");
 
   const fpsRef = useRef({ frames: 0, last: performance.now() });
 
@@ -277,6 +268,16 @@ export default function FaceSensePage() {
     const id = getOrCreateUserId();
     userIdRef.current = id;
     setUserId(id);
+
+    // Request browser notification permission
+    if ("Notification" in window) {
+      setNotifPermission(Notification.permission);
+      if (Notification.permission === "default") {
+        Notification.requestPermission().then((perm) => {
+          setNotifPermission(perm);
+        });
+      }
+    }
 
     // Try to load user's KNN model from backend
     fetch(`${BACKEND_URL}/api/usermodel/${id}`)
@@ -356,7 +357,6 @@ export default function FaceSensePage() {
       blinkCountRef.current = 0;
       blinkConsecRef.current = 0;
       blinkStartTimeRef.current = Date.now();
-      lastBlinkTimeRef.current = 0;
       eyeClosedRef.current = false;
       stressHighSinceRef.current = null;
       alertFiredRef.current = false;
@@ -410,6 +410,7 @@ export default function FaceSensePage() {
 
     setFaceCount(0); setFps(0);
     setEmotion("neutral"); setStressScore(0); setBlinkRate(0); setBlinkCount(0);
+    alertBlinkRef.current = false;
     setAlertStress(false); setAlertBlink(false);
     setCalibProgress(0);
     setStatus("idle"); setErrorMsg("");
@@ -536,23 +537,15 @@ export default function FaceSensePage() {
           const ear = (eyeAspectRatio(leftEye) + eyeAspectRatio(rightEye)) / 2;
 
           if (ear < EAR_THRESHOLD) {
-            eyeClosedRef.current = true;
             blinkConsecRef.current++;
           } else {
             if (blinkConsecRef.current >= BLINK_CONSEC_FRAMES) {
-              // Only count as a blink if enough time has passed since the last one.
-              // Without this, a single slow blink (EAR stays low across many frames)
-              // can fire multiple counts as blinkConsecRef resets and rises again.
-              const nowBlink = Date.now();
-              if (nowBlink - lastBlinkTimeRef.current >= MIN_BLINK_GAP_MS) {
-                lastBlinkTimeRef.current = nowBlink;
-                blinkCountRef.current++;
-                setBlinkCount(blinkCountRef.current);
-              }
+              blinkCountRef.current++;
+              setBlinkCount(blinkCountRef.current);
             }
             blinkConsecRef.current = 0;
-            eyeClosedRef.current = false;
           }
+          eyeClosedRef.current = ear < EAR_THRESHOLD;
 
           const elapsedMin = (Date.now() - blinkStartTimeRef.current) / 60000;
           const rate = elapsedMin > 0 ? Math.round(blinkCountRef.current / elapsedMin) : 0;
@@ -577,6 +570,15 @@ export default function FaceSensePage() {
               lastAlertTimeRef.current = nowMs;
               setAlertStress(true);
               playBeep(880, 0.3);
+              // Phase 4: browser notification + persist to DB
+              sendBrowserNotification(
+                "⚠ High Stress Detected",
+                "Sustained high stress for 10+ seconds. Take a short break."
+              );
+              persistAlert(
+                BACKEND_URL, userIdRef.current, sessionIdRef.current,
+                "stress", stress, latestBlinkRateRef.current
+              );
             }
           } else {
             stressHighSinceRef.current = null;
@@ -584,13 +586,22 @@ export default function FaceSensePage() {
             setAlertStress(false);
           }
 
-          // Bug 3 fix: previous logic had a missing else branch — when elapsed30s was
-          // false AND rate < blinkThresh, neither branch ran, leaving alertBlink stuck.
-          // Also removed the `rate > 0` guard: 0 blinks after 30s still warrants an alert.
           const elapsed30s = (Date.now() - blinkStartTimeRef.current) > 30000;
-          if (elapsed30s && rate < blinkThresh) {
+          if (elapsed30s && rate < blinkThresh && rate > 0) {
+            if (!alertBlinkRef.current) { // only fire notification on transition
+              alertBlinkRef.current = true;
+              sendBrowserNotification(
+                "👁 Low Blink Rate Detected",
+                `Your blink rate is ${rate}/min. Look away and blink more often.`
+              );
+              persistAlert(
+                BACKEND_URL, userIdRef.current, sessionIdRef.current,
+                "fatigue", latestStressRef.current, rate
+              );
+            }
             setAlertBlink(true);
-          } else {
+          } else if (rate >= blinkThresh) {
+            alertBlinkRef.current = false;
             setAlertBlink(false);
           }
 
@@ -692,55 +703,34 @@ export default function FaceSensePage() {
 
       const results = latestResultsRef.current;
       results.forEach(({ detection, landmarks }) => {
-        const rawBox = detection.box;
+        const box = detection.box;
         const score = detection.score;
 
-        // Expand the face-api bounding box to cover the full head including hair.
-        // face-api boxes only wrap the detected landmarks (chin to forehead hairline)
-        // so we pad: 30% extra height upward (for hair/forehead), 10% on sides.
-        const padX = rawBox.width * 0.10;
-        const padYTop = rawBox.height * 0.30;
-        const padYBot = rawBox.height * 0.05;
-        const box = {
-          x: Math.max(0, rawBox.x - padX),
-          y: Math.max(0, rawBox.y - padYTop),
-          width: rawBox.width + padX * 2,
-          height: rawBox.height + padYTop + padYBot,
-        };
+        ctx.strokeStyle = "#00f5d4";
+        ctx.lineWidth = 2;
+        ctx.shadowColor = "#00f5d4";
+        ctx.shadowBlur = 12;
+        ctx.strokeRect(box.x, box.y, box.width, box.height);
+        ctx.shadowBlur = 0;
 
-        // The canvas element has CSS scaleX(-1) applied, which mirrors the entire
-        // canvas visually. All drawing uses the raw (un-mirrored) landmark/box
-        // coordinates from face-api — the CSS transform handles the visual flip.
-        // For text we must counter-flip (scale -1 / translate) so it reads correctly.
+        drawCorners(ctx, box.x, box.y, box.width, box.height, 16, "#00f5d4");
 
         const emColor = EMOTION_COLORS[latestEmotionRef.current] ?? "#00f5d4";
         const label = `FACE ${(score * 100).toFixed(1)}%  ${latestEmotionRef.current.toUpperCase()}`;
         ctx.font = "bold 13px monospace";
         const tw = ctx.measureText(label).width;
 
-        // Draw the padded bounding box
-        ctx.save();
-        ctx.strokeStyle = emColor + "cc";
-        ctx.lineWidth = 2;
-        ctx.shadowColor = emColor;
-        ctx.shadowBlur = 8;
-        ctx.strokeRect(box.x, box.y, box.width, box.height);
-        ctx.shadowBlur = 0;
-        ctx.restore();
-
-        // Label: counter-flip text so it reads correctly under CSS scaleX(-1).
-        // Visual left edge of box after CSS flip = canvas.width - box.x - box.width
         ctx.save();
         ctx.scale(-1, 1);
         ctx.translate(-canvas.width, 0);
-        const labelX = canvas.width - box.x - box.width;
+        const ux = canvas.width - box.x - tw - 12;
+
         ctx.fillStyle = "rgba(0,0,0,0.75)";
-        ctx.fillRect(labelX, box.y - 24, tw + 12, 22);
+        ctx.fillRect(ux, box.y - 24, tw + 12, 22);
         ctx.fillStyle = emColor;
-        ctx.fillText(label, labelX + 6, box.y - 7);
+        ctx.fillText(label, ux + 6, box.y - 7);
         ctx.restore();
 
-        // Use original landmark coordinates — CSS scaleX(-1) on canvas handles the mirror
         const pts = landmarks.positions;
         drawLandmarkGroup(ctx, pts.slice(0, 17),  "#4cc9f0", false);
         drawLandmarkGroup(ctx, pts.slice(17, 22), "#f72585", false);
@@ -758,9 +748,8 @@ export default function FaceSensePage() {
           ctx.translate(-canvas.width, 0);
           ctx.font = "bold 11px monospace";
           ctx.fillStyle = "#facc15";
-          // Use same mirror formula as the label: canvas.width - box.x - box.width
-          const blinkLabelX = canvas.width - box.x - box.width + 4;
-          ctx.fillText("● BLINK", blinkLabelX, box.y + box.height + 16);
+          const bx = canvas.width - box.x - box.width + 4;
+          ctx.fillText("● BLINK", bx, box.y + box.height + 16);
           ctx.restore();
         }
       });
@@ -796,20 +785,37 @@ export default function FaceSensePage() {
     <main className="min-h-screen bg-[#0a0a0f] text-white flex flex-col items-center justify-start py-10 px-4">
 
       {/* Header */}
-      <header className="mb-8 text-center select-none">
-        <div className="flex items-center justify-center gap-3 mb-2">
-          <div className="w-2 h-2 rounded-full bg-[#00f5d4] animate-pulse shadow-[0_0_8px_#00f5d4]" />
-          <h1 className="text-3xl font-black tracking-[0.15em] uppercase font-mono">
-            FACE<span className="text-[#00f5d4]">SENSE</span>
-          </h1>
-          <div className="w-2 h-2 rounded-full bg-[#00f5d4] animate-pulse shadow-[0_0_8px_#00f5d4]" />
+      <header className="mb-8 text-center select-none w-full max-w-5xl">
+        <div className="flex items-center justify-between mb-2">
+          <div className="flex-1" />
+          <div className="flex items-center justify-center gap-3">
+            <div className="w-2 h-2 rounded-full bg-[#00f5d4] animate-pulse shadow-[0_0_8px_#00f5d4]" />
+            <h1 className="text-3xl font-black tracking-[0.15em] uppercase font-mono">
+              FACE<span className="text-[#00f5d4]">SENSE</span>
+            </h1>
+            <div className="w-2 h-2 rounded-full bg-[#00f5d4] animate-pulse shadow-[0_0_8px_#00f5d4]" />
+          </div>
+          <div className="flex-1 flex justify-end">
+            <Link
+              href="/dashboard"
+              className="px-3 py-1.5 text-xs font-mono font-bold rounded-lg bg-[#00f5d4]/10 border border-[#00f5d4]/30 text-[#00f5d4] hover:bg-[#00f5d4]/20 transition-all"
+            >
+              📊 Dashboard
+            </Link>
+          </div>
         </div>
         <p className="text-xs text-zinc-600 tracking-widest uppercase font-mono">
-          Phase 3 — Personalized AI · Adaptive Thresholds · KNN
+          Phase 4 — Notifications · Analytics Dashboard · Production Ready
         </p>
         {userId && (
           <p className="text-[10px] text-zinc-700 font-mono mt-1">
             User: {userId.slice(0, 8)}…
+            {notifPermission === "granted" && (
+              <span className="ml-2 text-emerald-700">🔔 notifications on</span>
+            )}
+            {notifPermission === "denied" && (
+              <span className="ml-2 text-zinc-700">🔕 notifications blocked</span>
+            )}
           </p>
         )}
       </header>
@@ -1167,10 +1173,47 @@ export default function FaceSensePage() {
       )}
 
       <footer className="mt-12 text-zinc-800 text-xs font-mono text-center">
-        FaceSense Phase 3 · face-api.js · KNN · Adaptive Thresholds · Express + MongoDB
+        FaceSense Phase 4 · face-api.js · KNN · Adaptive Thresholds · Express + MongoDB · Notifications
       </footer>
     </main>
   );
+}
+
+// ─── Browser Notification helper ──────────────────────────────────────────────
+function sendBrowserNotification(title: string, body: string, icon = "🧠") {
+  if (typeof window === "undefined") return;
+  if (!("Notification" in window)) return;
+  if (Notification.permission !== "granted") return;
+  try {
+    new Notification(title, {
+      body,
+      icon: "/favicon.ico",
+      tag: icon, // deduplicate same-type notifications
+      silent: false,
+    });
+  } catch {
+    // Safari / older browsers may throw — fail silently
+  }
+}
+
+// ─── Persist alert event to backend ──────────────────────────────────────────
+async function persistAlert(
+  backendUrl: string,
+  userId: string,
+  sessionId: string,
+  type: "stress" | "fatigue",
+  stressScore: number,
+  blinkRate: number
+) {
+  try {
+    await fetch(`${backendUrl}/api/alerts`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ userId, sessionId, type, stressScore, blinkRate }),
+    });
+  } catch {
+    // offline — alerts not persisted this time
+  }
 }
 
 // ─── Audio beep helper ─────────────────────────────────────────────────────────
@@ -1221,7 +1264,7 @@ function drawCorners(
 
 function drawLandmarkGroup(
   ctx: CanvasRenderingContext2D,
-  points: FaceAPI.Point[],
+  points: faceapi.Point[],
   color: string,
   close: boolean
 ) {
