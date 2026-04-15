@@ -115,7 +115,7 @@ const FALLBACK_STRESS_THRESHOLD = 0.7;
 const FALLBACK_BLINK_THRESHOLD = 8;
 
 // ─── Utility functions ─────────────────────────────────────────────────────────
-function euclidean(a: faceapi.Point, b: faceapi.Point) {
+function euclidean(a: FaceAPI.Point, b: FaceAPI.Point) {
   return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2);
 }
 
