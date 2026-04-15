@@ -15,7 +15,7 @@
 
 import { useEffect, useRef, useCallback, useState } from "react";
 import Link from "next/link";
-import type * as faceapiTypes from "@vladmandic/face-api";
+import type * as FaceAPI from "@vladmandic/face-api";
 
 // @vladmandic/face-api uses browser APIs — must not be imported at module level
 // during SSR. We load it lazily inside useEffect (client-only).
@@ -62,9 +62,9 @@ const STATUS_COLORS: Record<Status, string> = {
 };
 
 type FaceResult = {
-  detection: faceapi.FaceDetection;
-  landmarks: faceapi.FaceLandmarks68;
-  expressions: faceapi.FaceExpressions;
+  detection: FaceAPI.FaceDetection;
+  landmarks: FaceAPI.FaceLandmarks68;
+  expressions: FaceAPI.FaceExpressions;
   descriptor?: Float32Array;
 };
 
@@ -132,7 +132,7 @@ function eyeAspectRatio(pts: faceapi.Point[]): number {
   return (A + B) / (2.0 * C);
 }
 
-function mapEmotionToStress(expressions: faceapi.FaceExpressions): number {
+function mapEmotionToStress(expressions: FaceAPI.FaceExpressions): number {
   let score = 0;
   const exprObj = expressions as unknown as Record<string, number>;
   for (const [emotion, weight] of Object.entries(STRESS_WEIGHTS)) {
@@ -141,7 +141,7 @@ function mapEmotionToStress(expressions: faceapi.FaceExpressions): number {
   return Math.min(1, score);
 }
 
-function dominantEmotion(expressions: faceapi.FaceExpressions): string {
+function dominantEmotion(expressions: FaceAPI.FaceExpressions): string {
   const exprObj = expressions as unknown as Record<string, number>;
   return Object.entries(exprObj).reduce((a, b) => (b[1] > a[1] ? b : a))[0];
 }
